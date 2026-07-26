@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+sales_history.db
+.venv/
+venv/
