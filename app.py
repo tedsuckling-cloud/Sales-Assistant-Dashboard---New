@@ -3,12 +3,16 @@ import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from io import BytesIO, StringIO
+from html import escape
 from html.parser import HTMLParser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import os
+import uuid
+import shutil
+import hashlib
 
-from flask import Flask, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, redirect, render_template_string, request, send_file, url_for, send_from_directory
 import pandas as pd
 from bs4 import BeautifulSoup
 from reportlab.lib import colors
@@ -28,6 +32,159 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_PATH = DATA_DIR / "sales_history.db"
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+def audit_event(event_type, detail="", trip_id=None, appointment_id=""):
+    try:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            connection.execute("INSERT INTO audit_log (event_type,detail,trip_id,appointment_id,created_at) VALUES (?,?,?,?,?)",
+                               (event_type, str(detail or ""), trip_id, appointment_id or "", datetime.now().isoformat(timespec="seconds")))
+            connection.commit()
+    except Exception:
+        pass
+
+def create_database_backup(reason="manual"):
+    if not DATABASE_PATH.exists():
+        return None
+    stamp=datetime.now().strftime("%Y%m%d-%H%M%S")
+    target=BACKUP_DIR / f"sales_history-{stamp}-{re.sub(r'[^A-Za-z0-9_-]+','_',reason)[:30]}.db"
+    with sqlite3.connect(DATABASE_PATH) as source, sqlite3.connect(target) as dest:
+        source.backup(dest)
+    return target
+
+def appointment_uid(trip_id, schedule_id, visit_date, visit_time, store_name):
+    raw=f"{trip_id or 0}|{schedule_id or 0}|{visit_date}|{visit_time}|{str(store_name).strip().casefold()}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def ensure_reliability_tables(connection):
+    """Create Stage 9 support tables and columns before any reliability feature uses them."""
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS app_state (
+            state_key TEXT PRIMARY KEY,
+            state_value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            trip_id INTEGER,
+            appointment_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS trip_appointments (
+            appointment_id TEXT PRIMARY KEY,
+            trip_id INTEGER NOT NULL,
+            schedule_id INTEGER NOT NULL,
+            visit_date TEXT NOT NULL,
+            visit_time TEXT NOT NULL DEFAULT '',
+            store_name TEXT NOT NULL,
+            sequence_no INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    table_names = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "road_visit_notes" in table_names:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(road_visit_notes)").fetchall()}
+        if "appointment_id" not in columns:
+            connection.execute("ALTER TABLE road_visit_notes ADD COLUMN appointment_id TEXT NOT NULL DEFAULT ''")
+    if "road_visit_attachments" in table_names:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(road_visit_attachments)").fetchall()}
+        if "appointment_id" not in columns:
+            connection.execute("ALTER TABLE road_visit_attachments ADD COLUMN appointment_id TEXT NOT NULL DEFAULT ''")
+
+
+def set_active_trip(trip_id):
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        ensure_reliability_tables(connection)
+        connection.execute(
+            "INSERT INTO app_state (state_key,state_value,updated_at) VALUES ('active_trip_id',?,?) "
+            "ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value,updated_at=excluded.updated_at",
+            (str(trip_id or ""), datetime.now().isoformat(timespec="seconds")),
+        )
+        connection.commit()
+
+
+def get_active_trip_id():
+    try:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            ensure_reliability_tables(connection)
+            row = connection.execute(
+                "SELECT state_value FROM app_state WHERE state_key='active_trip_id'"
+            ).fetchone()
+            connection.commit()
+    except sqlite3.Error:
+        return None
+    try:
+        return int(row[0]) if row and row[0] else None
+    except (TypeError, ValueError):
+        return None
+
+ROUTE_DEFAULTS = {
+    'rep_start': '07:00',
+    'rep_end': '18:00',
+    'customer_open': '08:00',
+    'customer_close': '17:00',
+}
+
+
+def get_route_defaults():
+    values = dict(ROUTE_DEFAULTS)
+    try:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            ensure_reliability_tables(connection)
+            rows = connection.execute(
+                "SELECT state_key,state_value FROM app_state WHERE state_key IN ('route_rep_start','route_rep_end','route_customer_open','route_customer_close')"
+            ).fetchall()
+            connection.commit()
+        mapping = {
+            'route_rep_start': 'rep_start',
+            'route_rep_end': 'rep_end',
+            'route_customer_open': 'customer_open',
+            'route_customer_close': 'customer_close',
+        }
+        for key, value in rows:
+            if key in mapping and re.fullmatch(r'\d{2}:\d{2}', value or ''):
+                values[mapping[key]] = value
+    except sqlite3.Error:
+        pass
+    return values
+
+
+def save_route_defaults(rep_start, rep_end, customer_open, customer_close):
+    values = {
+        'route_rep_start': rep_start,
+        'route_rep_end': rep_end,
+        'route_customer_open': customer_open,
+        'route_customer_close': customer_close,
+    }
+    if not all(re.fullmatch(r'\d{2}:\d{2}', value or '') for value in values.values()):
+        raise ValueError('All route-default times must be valid.')
+    if rep_end <= rep_start:
+        raise ValueError('Rep finish time must be later than rep start time.')
+    if customer_close <= customer_open:
+        raise ValueError('Customer closing time must be later than opening time.')
+    now = datetime.now().isoformat(timespec='seconds')
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        ensure_reliability_tables(connection)
+        for key, value in values.items():
+            connection.execute(
+                "INSERT INTO app_state (state_key,state_value,updated_at) VALUES (?,?,?) ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value,updated_at=excluded.updated_at",
+                (key, value, now),
+            )
+        connection.commit()
+
+ROUTE_CUSTOMER_SEED = '[{"external_id":"4354","name":"Hammer Hardware Whitianga","street":"225 South Highway","city":"WHITIANGA","zip":"3510","country":"New Zealand","customer_group":"Hammer Hardware","categories":"C","phone":"07 866 4347","email":"whitianga@hammerhardware.co.nz","call_note":"Greens opportunities, Indents","last_call":"2026-02-26","call_interval":120,"urgency":"overdue","latitude":-36.836229,"longitude":175.677105,"portatour_id":"942556f8f94845e6a1cd22933155b61b"},{"external_id":"2035","name":"Carters Whitianga","street":"Moewai Road","city":"WHITIANGA","zip":"3591","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"07 866 2489","email":"whitianga.orders@carters.co.nz","call_note":"","last_call":"2026-02-26","call_interval":180,"urgency":"due","latitude":-36.823986,"longitude":175.671813,"portatour_id":"213441f776e144ef9fd3704f580bce66"},{"external_id":"2497","name":"Mitre 10 Waihi","street":"Seddon Street","city":"WAIHI","zip":"3610","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"07 863 8087","email":"deborah.edwards@mitre10.co.nz","call_note":"Duratuf \'Spot\' for signage and brochures, Carts/greens opportunities","last_call":"2026-02-26","call_interval":90,"urgency":"overdue","latitude":-37.390641,"longitude":175.841702,"portatour_id":"96fa149f3a894190a371966053362b99"},{"external_id":"1981","name":"Bunnings Whangamata","street":"213 Aickin Road","city":"WHANGAMATA","zip":"3620","country":"New Zealand","customer_group":"Bunnings","categories":"B","phone":"07 865 8744","email":"whangamata@bunnings.co.nz","call_note":"Training","last_call":"2026-04-22","call_interval":90,"urgency":"due","latitude":-37.201981,"longitude":175.866447,"portatour_id":"b1db31c086704b209074de1838a67e03"},{"external_id":"2032","name":"Carters Whangamata","street":"103 Lindsay Road","city":"WHANGAMATA","zip":"3620","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"07 865 8590","email":"","call_note":"Establish Contact, Armorsteel","last_call":"2026-04-22","call_interval":180,"urgency":"not due","latitude":-37.202928,"longitude":175.865892,"portatour_id":"8037f226a37a40be9050a1bdcfbcb67d"},{"external_id":"2397","name":"ITM Pauanui","street":"27 Sheppard Avenue","city":"PAUANUI BEACH","zip":"3579","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"07 864 8579","email":"pauanui.itm@xtra.co.nz","call_note":"Greens Parts, Aromachef stock, display?:)","last_call":"2026-02-26","call_interval":180,"urgency":"due","latitude":-37.020933,"longitude":175.858711,"portatour_id":"9877c1d32c484e17b3dca961787a96f3"},{"external_id":"8595","name":"Hammer Hardware Tairua","street":"232A Main Road","city":"","zip":"3508","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"07 846 8080","email":"admin@bltairua.nz","call_note":"","last_call":"2026-04-22","call_interval":180,"urgency":"not due","latitude":-37.001268,"longitude":175.848815,"portatour_id":"9f06676798214ad09953ac61658889b9"},{"external_id":"2159","name":"Placemakers Whitianga","street":"24 Joan Gaskell Drive","city":"WHITIANGA","zip":"3510","country":"New Zealand","customer_group":"Placemakers","categories":"B","phone":"07 867 2000","email":"jessica.hamilton@placemakers.co.nz","call_note":"Displays - July","last_call":"2026-04-22","call_interval":90,"urgency":"due","latitude":-36.834437,"longitude":175.698265,"portatour_id":"d569fd9dc0704dd09ca2d717cb4e85b1"},{"external_id":"2345","name":"ITM Coromandel","street":"1170 Tiki Rd","city":"COROMANDEL","zip":"3506","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"07 866 8848","email":"coroitm@xtra.co.nz","call_note":"","last_call":"2025-10-28","call_interval":180,"urgency":"overdue","latitude":-36.76755,"longitude":175.505402,"portatour_id":"387ac68ed7d24b8cbc1c145802ffe3c5"},{"external_id":"1057","name":"Cooks Beach Timber & Hardware","street":"43 Captain Cook Road","city":"WHITIANGA","zip":"3591","country":"New Zealand","customer_group":"Other","categories":"D","phone":"07 866 4049","email":"shane@cbth.co.nz","call_note":"Follow Up Signage","last_call":"2026-04-22","call_interval":360,"urgency":"not due","latitude":-36.839233,"longitude":175.742924,"portatour_id":"cfa43b115acf49278d6ec7985246c87d"},{"external_id":"2148","name":"Placemakers Thames","street":"79 Kopu Rd","city":"THAMES","zip":"3578","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"07 868 0130","email":"graeme.saunders@placemakers.co.nz","call_note":"Make appt with Graham","last_call":"2026-02-05","call_interval":120,"urgency":"overdue","latitude":-37.188365,"longitude":175.566611,"portatour_id":"62b36a8970c84862808e279241a87591"},{"external_id":"2494","name":"Mitre 10 Thames","street":"458 Pollen Street","city":"THAMES","zip":"3500","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"07 868 7155","email":"thames@mitre10.co.nz","call_note":"Send barrow storage options","last_call":"2026-02-05","call_interval":120,"urgency":"overdue","latitude":-37.140466,"longitude":175.542989,"portatour_id":"f365be63be4b42c5b23935ebabf6944c"},{"external_id":"2025","name":"Carters Thames","street":"State Highway 26","city":"THAMES","zip":"3578","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"07 868 7047","email":"Owen.Hughes@carters.co.nz","call_note":"","last_call":"2026-04-22","call_interval":180,"urgency":"not due","latitude":-37.204746,"longitude":175.600359,"portatour_id":"55dc94edea5244ccbecc07986c7c2459"},{"external_id":"2376","name":"Dayle ITM Kopu","street":"71 Kopu Road","city":"THAMES","zip":"3578","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"07 868 9827","email":"martin@kopuitm.co.nz","call_note":"","last_call":"2026-04-22","call_interval":180,"urgency":"not due","latitude":-37.187409,"longitude":175.566285,"portatour_id":"18bccd63dd34427786ae59d7588a0c76"},{"external_id":"4337","name":"Hammer Hardware Ngatea","street":"16 Orchard Road","city":"NGATEA","zip":"3503","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"07 867 7393","email":"ngatea@hammerhardware.co.nz","call_note":"","last_call":"2026-02-05","call_interval":180,"urgency":"due","latitude":-37.276095,"longitude":175.496979,"portatour_id":"ca089e6a6e814e0eaf13c99dcf880a5f"},{"external_id":"1958","name":"Bunnings New Plymouth","street":"59 Molesworth Street","city":"NEW PLYMOUTH","zip":"4310","country":"New Zealand","customer_group":"Bunnings","categories":"B","phone":"06 758 0491","email":"admin.newplymouth@bunnings.co.nz","call_note":"","last_call":"2026-02-03","call_interval":90,"urgency":"overdue","latitude":-39.05453,"longitude":174.078394,"portatour_id":"5e647e745b754bcdbcfe77cdaeeb6b2b"},{"external_id":"2487","name":"Mitre 10 Taumarunui","street":"Taitua Street","city":"TAUMARUNUI","zip":"3920","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"07 895 8107","email":"taumarunui@mitre10.co.nz","call_note":"","last_call":"2026-07-21","call_interval":120,"urgency":"not due","latitude":-38.884535,"longitude":175.271496,"portatour_id":"e097841ec2c045d69303441346401ea0"},{"external_id":"2403","name":"ITM Standard Timber (Stratford)","street":"75 Warwick Road","city":"STRATFORD","zip":"4332","country":"New Zealand","customer_group":"ITM","categories":"C","phone":"06 765 7800","email":"mike@itmstratford.co.nz","call_note":"Displays","last_call":"2026-07-23","call_interval":120,"urgency":"not due","latitude":-39.350598,"longitude":174.289179,"portatour_id":"3225f0b4f3fc43e6a184e507167f7080"},{"external_id":"2108","name":"Placemakers Hawera","street":"Cnr Waihi Road & Fitzgerald Lane","city":"HAWERA","zip":"4610","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"06 278 6013","email":"maree.beare@placemakers.co.nz","call_note":"","last_call":"2026-07-22","call_interval":120,"urgency":"not due","latitude":-39.566388,"longitude":174.272445,"portatour_id":"21b5098f7aa74b04960a4d0eb0bdf512"},{"external_id":"2501","name":"Mitre 10 Mega Wanganui","street":"200 Taupo Quay","city":"WANGANUI","zip":"4500","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"06 349 0244","email":"brett.puklowski@mitre10.co.nz","call_note":"Training, QBR: GL75 f/u, poly carts for them and stratford","last_call":"2026-02-03","call_interval":45,"urgency":"overdue","latitude":-39.942291,"longitude":175.046628,"portatour_id":"c56d7576a9264e7ea38f43d639e9e324"},{"external_id":"2009","name":"Carters New Plymouth","street":"24 Egmont Road","city":"New Plymouth","zip":"4312","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"06 759 5460","email":"","call_note":"Meeting w/ Nigel re A/S","last_call":"2026-03-17","call_interval":180,"urgency":"due","latitude":-39.044933,"longitude":174.125639,"portatour_id":"f4ba74923d46440a83b268de6d85fe39"},{"external_id":"8637","name":"Bunnings New Plymouth Trade Centre","street":"55 Corbett Road","city":"Bell Block","zip":"4312","country":"New Zealand","customer_group":"Bunnings","categories":"D","phone":"06 755 0304","email":"admin.newplymouth@bunnings.co.nz","call_note":"Armorsteel","last_call":"2026-07-23","call_interval":180,"urgency":"not due","latitude":-39.036536,"longitude":174.162338,"portatour_id":"b3818ffac341418cbbecea5bda49760c"},{"external_id":"2466","name":"Mitre 10 Mega New Plymouth","street":"5 Vickers Rd","city":"NEW PLYMOUTH","zip":"4312","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"06 759 4399","email":"michelle.ebert@meganewplymouth.co.nz","call_note":"*Signage* Meet Les Nairn. LS500, GL75E.","last_call":"2026-07-23","call_interval":45,"urgency":"not due","latitude":-39.046189,"longitude":174.114884,"portatour_id":"54252d8550464864b5b7f585a421778f"},{"external_id":"2028","name":"Carters Wanganui","street":"95 Wilson Street","city":"WANGANUI","zip":"4500","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"06 348 1750","email":"Gwynne.Matthews@carters.co.nz","call_note":"","last_call":"2026-07-22","call_interval":180,"urgency":"not due","latitude":-39.932563,"longitude":175.044414,"portatour_id":"b86f5a4c1b7240438732ad1c10c919df"},{"external_id":"2392","name":"ITM New Plymouth Building Supplies","street":"20 Dawson Street","city":"NEW PLYMOUTH","zip":"4310","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 758 8939","email":"graeme@npbs.co.nz","call_note":"","last_call":"2026-07-23","call_interval":180,"urgency":"not due","latitude":-39.058119,"longitude":174.067635,"portatour_id":"b12279c8c3154bacb6e4e330258a7725"},{"external_id":"2420","name":"ITM Waitara","street":"Cnr Harris & Richmond Streets","city":"WAITARA","zip":"4320","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 754 8822","email":"annette@waitaraitm.co.nz","call_note":"Display Shed *CONTACTED*","last_call":"2026-03-17","call_interval":180,"urgency":"due","latitude":-38.995011,"longitude":174.242646,"portatour_id":"d8e4bb30886949e8b6824687187adb35"},{"external_id":"1944","name":"Bunnings Hawera","street":"175-179 Glover Road","city":"HAWERA","zip":"4610","country":"New Zealand","customer_group":"Bunnings","categories":"B","phone":"06 278 0130","email":"admin.hawera@bunnings.co.nz","call_note":"Armorsteel, brochure Holders","last_call":"2026-07-22","call_interval":90,"urgency":"not due","latitude":-39.577006,"longitude":174.275826,"portatour_id":"bbffc27cbb4944bc915719c848d150b8"},{"external_id":"1978","name":"Bunnings Wanganui","street":"131 Ridgway Street","city":"WANGANUI","zip":"4500","country":"New Zealand","customer_group":"Bunnings","categories":"D","phone":"06 345 0985","email":"wanganui@bunnings.co.nz","call_note":"Training, Shedbuilder tool (Emailed)","last_call":"2026-02-04","call_interval":180,"urgency":"due","latitude":-39.937123,"longitude":175.050769,"portatour_id":"132c776a6bdb4069909738a6b33c340e"},{"external_id":"2130","name":"Placemakers New Plymouth","street":"15 Egmont Road","city":"NEW PLYMOUTH","zip":"4372","country":"New Zealand","customer_group":"Placemakers","categories":"B","phone":"06 755 9040","email":"sharlene.tyler@placemakers.co.nz","call_note":"Clean the sheds, bring Greens brochure","last_call":"2026-03-17","call_interval":90,"urgency":"overdue","latitude":-39.044309,"longitude":174.125318,"portatour_id":"bb909aeb57a8419997e84ce8fa313c60"},{"external_id":"2132","name":"Placemakers Ohakune","street":"7 Burns Street","city":"OHAKUNE","zip":"4625","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"06 385 8414","email":"chrissy.cannan@placemakers.co.nz","call_note":"PA Doors","last_call":"2026-07-21","call_interval":180,"urgency":"not due","latitude":-39.416063,"longitude":175.394762,"portatour_id":"268e0fdbcd1942bbbdd18112db05eae8"},{"external_id":"2154","name":"Placemakers Wanganui","street":"Cnr Wilson & Guyton Streets","city":"WANGANUI","zip":"4500","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"06 349 1919","email":"diane.winter@placemakers.co.nz","call_note":"","last_call":"2025-05-21","call_interval":180,"urgency":"overdue","latitude":-39.93417,"longitude":175.047143,"portatour_id":"e2d0b8c1b6e14f9eb9a8862979d2bfb9"},{"external_id":"2468","name":"Mitre 10 New Plymouth","street":"305-307 St Aubyn Street","city":"NEW PLYMOUTH","zip":"4310","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"067580520","email":"J10Service.Desk@mitre10.co.nz","call_note":"WB Rack for Trade","last_call":"2026-02-03","call_interval":120,"urgency":"overdue","latitude":-39.059737,"longitude":174.058048,"portatour_id":"74b057e1e9ec4d8a90293bfe39e9ebf1"},{"external_id":"2485","name":"Mitre 10 Stratford","street":"Corner Juliet & Fenton Streets","city":"STRATFORD","zip":"4332","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"06 765 6048","email":"hayden.gibson@mitre10.co.nz","call_note":"Polycart F/U. Greens Brochure.","last_call":"2026-07-23","call_interval":120,"urgency":"not due","latitude":-39.340864,"longitude":174.286688,"portatour_id":"c5a60f4c994c428a9231a3ef6708c0f7"},{"external_id":"4329","name":"Hammer Hardware Inglewood","street":"24-26 Matai Street","city":"TARANAKI","zip":"4330","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"06 756 8009","email":"inglewood@hammerhardware.co.nz","call_note":"","last_call":"2026-07-23","call_interval":360,"urgency":"not due","latitude":-39.156818,"longitude":174.207455,"portatour_id":"df83abe4160846bb87ceb47c85a422e5"},{"external_id":"1274","name":"North Taranaki ITM Waiwhakaiho","street":"1 Katere Road","city":"NEW PLYMOUTH","zip":"4312","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 759 7435","email":"","call_note":"Try for shed signage","last_call":"2025-09-02","call_interval":42,"urgency":"not due","latitude":-39.050251,"longitude":174.114737,"portatour_id":"83bfe94429a74cdba402e1e855c23b31"},{"external_id":"","name":"Read Brothers Independent","street":"332 Pollen Street","city":"Thames","zip":"3500","country":"NZ","customer_group":"Other","categories":"","phone":"","email":"","call_note":"","last_call":"2023-12-07","call_interval":180,"urgency":"overdue","latitude":-37.142814,"longitude":175.544132,"portatour_id":"27bd56a74d724fd191fecac767ad0dac"},{"external_id":"2367","name":"ITM Havelock Building Centre","street":"6 Ngati Kuia Drive","city":"South Island","zip":"7100","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 574 1018","email":"manager@itmhavelock.co.nz","call_note":"F/up Armorsteel and Concreters","last_call":"2026-07-29","call_interval":180,"urgency":"not due","latitude":-41.279911,"longitude":173.769678,"portatour_id":"bea1d0fdc8cd4d12bc3d9a61801c75b0"},{"external_id":"1180","name":"Hammer Hardware Picton","street":"53 High Street","city":"PICTON","zip":"7220","country":"New Zealand","customer_group":"Hammer Hardware","categories":"E","phone":"03 573 6422","email":"admin@pictonhardware.co.nz","call_note":"Greens Brochure/opportunities","last_call":"2026-04-29","call_interval":360,"urgency":"not due","latitude":-41.290474,"longitude":174.006767,"portatour_id":"adea5d9d7adf4387807ef4f42116c937"},{"external_id":"4324","name":"Hammer Hardware Golden Bay","street":"7 Commercial Street","city":"TAKAKA","zip":"7110","country":"New Zealand","customer_group":"Hammer Hardware","categories":"C","phone":"03 525 7265","email":"goldenbay@hammerhardware.co.nz","call_note":"Greens brochure/opportunities","last_call":"2026-03-05","call_interval":120,"urgency":"overdue","latitude":-40.860505,"longitude":172.805916,"portatour_id":"697c80a0acd14a69aae2b4d0acce9a7f"},{"external_id":"7125","name":"Hammer Hardware Kaikoura","street":"134-136 Beach Road","city":"Kaikoura","zip":"7300","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"03 319 5013","email":"kaikoura@mitre10.co.nz","call_note":"","last_call":"2026-07-29","call_interval":180,"urgency":"not due","latitude":-42.387018,"longitude":173.679294,"portatour_id":"b25fdc5ebc91457a87cf8b397ae55f66"},{"external_id":"2465","name":"Mitre 10 Mega Nelson","street":"99 Quarantine Rd","city":"NELSON","zip":"7011","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"03 547 0747","email":"brandon.beveridge@meganelson.co.nz","call_note":"Training, Display *HV Task*","last_call":"2026-07-28","call_interval":45,"urgency":"not due","latitude":-41.299489,"longitude":173.239706,"portatour_id":"9031d53807ca4796a63aad8b906bfb35"},{"external_id":"2388","name":"ITM Motueka","street":"16-18 King Edward Street","city":"MOTUEKA","zip":"7120","country":"New Zealand","customer_group":"ITM","categories":"C","phone":"03 528 7254","email":"alistair@itmmotueka.co.nz","call_note":"","last_call":"2026-07-28","call_interval":120,"urgency":"not due","latitude":-41.124256,"longitude":173.008076,"portatour_id":"e7a24813c1ed494e957af90905d251e7"},{"external_id":"2405","name":"ITM Takaka Building Centre","street":"5 Buxton Lane","city":"TAKAKA","zip":"7110","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 525 0005","email":"manager@itmtakaka.co.nz","call_note":"Assemble Loadmaster","last_call":"2026-03-05","call_interval":180,"urgency":"due","latitude":-40.858388,"longitude":172.807279,"portatour_id":"5b62c6718c49444e9a1b89ea64bd41bc"},{"external_id":"1930","name":"Bunnings Blenheim","street":"10 Westwood Avenue","city":"BLENHEIM","zip":"7271","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"09 520 9050","email":"specialorders.blenheim@bunnings.co.nz","call_note":"Training, Armorsteel","last_call":"2026-07-29","call_interval":45,"urgency":"not due","latitude":-41.507877,"longitude":173.924581,"portatour_id":"6d460d3ed0d24038b9c14e2b5409c6e8"},{"external_id":"1956","name":"Bunnings Nelson","street":"76 Saxton Road West","city":"NELSON","zip":"7011","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"03 547 1640","email":"nelson@bunnings.co.nz","call_note":"","last_call":"2026-07-28","call_interval":45,"urgency":"not due","latitude":-41.324374,"longitude":173.215617,"portatour_id":"a63c3e4f36de4833b7278d7b6253a40e"},{"external_id":"2455","name":"Mitre 10 Mega Marlborough","street":"174-186 Alabama Road","city":"BLENHEIM","zip":"7201","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"03 520 6600","email":"purchaseorders.marlborough@mitre10.co.nz","call_note":"Address seasonal gaps, Drill into shed sales drop. *HV Tasks*","last_call":"2026-07-29","call_interval":45,"urgency":"not due","latitude":-41.527848,"longitude":173.964411,"portatour_id":"51cf78a48c4249f3ad40243b9e3f2b98"},{"external_id":"2100","name":"Placemakers Blenheim","street":"Cnr Grove & Farmar Streets","city":"BLENHEIM","zip":"7201","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"03 578 9084","email":"donna.botham@placemakers.co.nz","call_note":"PA Door pricing issue","last_call":"2026-07-29","call_interval":180,"urgency":"not due","latitude":-41.504605,"longitude":173.960208,"portatour_id":"fe7d9804295249e481462c0c2a1bc06c"},{"external_id":"1984","name":"Carters Blenheim","street":"32 New Renwick Road","city":"BLENHEIM","zip":"7201","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"03 577 5344","email":"Shaun.Thompson@carters.co.nz","call_note":"Hygiene, Greens Parts, Armorsteel checkin w/James","last_call":"2026-07-29","call_interval":180,"urgency":"not due","latitude":-41.529079,"longitude":173.938732,"portatour_id":"ccef4f3df88b4cd19e7403cd3fdad230"},{"external_id":"2008","name":"Carters Nelson","street":"70 Nayland Road","city":"NELSON","zip":"7011","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"03 547 7700","email":"","call_note":"","last_call":"2026-07-28","call_interval":180,"urgency":"not due","latitude":-41.300824,"longitude":173.237257,"portatour_id":"c34c32a16d954193b7d8f7a9e0d7c52a"},{"external_id":"2342","name":"ITM Blenheim","street":"41 Houldsworth Street","city":"BLENHEIM","zip":"7201","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 578 3049","email":"rick.may@blenheimitm.co.nz","call_note":"Greens brochure/opportunities","last_call":"2026-07-29","call_interval":180,"urgency":"not due","latitude":-41.517049,"longitude":173.963944,"portatour_id":"2b3b6c706501484f9f8ce6a3dad9ed56"},{"external_id":"2373","name":"ITM Kaikoura Building Centre","street":"218 Beach Road","city":"KAIKOURA","zip":"7300","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 319 5447","email":"richard@kbcitm.co.nz","call_note":"","last_call":"2026-07-29","call_interval":180,"urgency":"not due","latitude":-42.379462,"longitude":173.680836,"portatour_id":"022a1c1fc62a4f83ab83e572e46a37e0"},{"external_id":"2391","name":"ITM Nelson","street":"36 Pascoe Street","city":"NELSON","zip":"7011","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 548 5487","email":"rodney@itmnelson.co.nz","call_note":"Signage, Parts, LS, Flashings","last_call":"2026-04-30","call_interval":180,"urgency":"not due","latitude":-41.292597,"longitude":173.240929,"portatour_id":"bdf6a5ad6c7b4652aeb8a659c74dd5b0"},{"external_id":"2398","name":"ITM Picton","street":"5 York Street","city":"PICTON","zip":"7220","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 573 6888","email":"robyn@pictonitm.co.nz","call_note":"Greens brochure/opportunities","last_call":"2026-04-29","call_interval":180,"urgency":"not due","latitude":-41.291189,"longitude":174.001665,"portatour_id":"c002d80793834cadb85c137f40952c3d"},{"external_id":"2124","name":"Placemakers Nelson, Mot Depot","street":"84 High St","city":"MOTUEKA","zip":"7120","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"03 528 8164","email":"callum.macdonald@placemakers.co.nz","call_note":"PA doors, aiden","last_call":"2026-07-28","call_interval":180,"urgency":"not due","latitude":-41.108714,"longitude":173.011222,"portatour_id":"04e85d0d85ab442d9e48b5c67d70ffa9"},{"external_id":"2128","name":"Placemakers Nelson, Saxton Rd","street":"52 Saxton Road West","city":"NELSON","zip":"7011","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"03 547 9111","email":"rebecca.priest@placemakers.co.nz","call_note":"Check New Displays, Arrange training","last_call":"2026-07-28","call_interval":120,"urgency":"not due","latitude":-41.323593,"longitude":173.214748,"portatour_id":"f232cd3906d84c058db0e446c063121a"},{"external_id":"2137","name":"Placemakers Nelson, (St Vincent Str)","street":"103 St Vincent Street","city":"NELSON","zip":"7010","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"03 547 9111","email":"adam.haycock@placemakers.co.nz","call_note":"PA Doors","last_call":"2024-10-09","call_interval":180,"urgency":"overdue","latitude":-41.277071,"longitude":173.273145,"portatour_id":"7e51f961999d45bcaa8e2b99946454e2"},{"external_id":"2462","name":"Mitre 10 Wilkins & Field - Motueka","street":"235 High Street","city":"MOTUEKA","zip":"7120","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"03 528 9220","email":"dave.richards@mitre10.co.nz","call_note":"Training, LS500s, Indent","last_call":"2026-07-28","call_interval":90,"urgency":"not due","latitude":-41.113427,"longitude":173.010986,"portatour_id":"2ffdc02517d24b499dba8233e2c92e8a"},{"external_id":"","name":"Nelson Airport","street":"Trent Drive","city":"Nelson","zip":"7011","country":"New Zealand","customer_group":"Other","categories":"","phone":"","email":"","call_note":"","last_call":"","call_interval":42,"urgency":"not due","latitude":-41.300015,"longitude":173.227469,"portatour_id":"a59d23a2bf144a5cab962196f5d432dd"},{"external_id":"","name":"Blenheim Airport","street":"23 Tancred Crescent","city":"Woodbourne","zip":"7206","country":"NZ","customer_group":"Other","categories":"","phone":"","email":"","call_note":"","last_call":"2024-10-10","call_interval":42,"urgency":"not due","latitude":-41.51318795737086,"longitude":173.86714519888616,"portatour_id":"9437bff6a31c497e9977b2ec3fa826b3"},{"external_id":"1969","name":"Bunnings Silverdale","street":"18 Hibiscus Coast Highway","city":"AUCKLAND","zip":"993","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"09 426 1529","email":"silverdale@bunnings.co.nz","call_note":"Training and brochures","last_call":"2026-01-08","call_interval":45,"urgency":"overdue","latitude":-36.6393,"longitude":174.715,"portatour_id":"634aea1d1aec4804bf55b3a0e8dc627f"},{"external_id":"2423","name":"ITM Whangarei Building Supplies","street":"Cnr Port & Kioreroa Roads","city":"WHANGAREI","zip":"110","country":"New Zealand","customer_group":"ITM","categories":"C","phone":"09 437 9400","email":"andrew.j@whangareiitm.co.nz","call_note":"Lifestyle Sign for Roadside Display. Meet Daves contact","last_call":"2026-03-31","call_interval":120,"urgency":"due","latitude":-35.739042,"longitude":174.334735,"portatour_id":"61cc4d115cd94a4c9da3c07b9d91b7e0"},{"external_id":"2142","name":"Placemakers Silverdale","street":"47 Tavern Road","city":"AUCKLAND","zip":"932","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 424 9000","email":"Conrad.venter@placemakers.co.nz","call_note":"Display Sheds, Armorsteel","last_call":"2026-02-25","call_interval":120,"urgency":"overdue","latitude":-36.62427,"longitude":174.673598,"portatour_id":"cd92699e153e45fe8ed7569114dd075f"},{"external_id":"2033","name":"Carters Whangaparaoa","street":"35 Karepiro Drive","city":"WHANGAPARAOA","zip":"932","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 424 6300","email":"Leanda.Adams@carters.co.nz","call_note":"Reinforce A/S","last_call":"2026-01-15","call_interval":180,"urgency":"due","latitude":-36.635731,"longitude":174.738898,"portatour_id":"48e728803f354bf4b42ef481591603ea"},{"external_id":"8287","name":"Renovation Warehouse","street":"28 Kioreroa Road","city":"Whangarei","zip":"0110","country":"New Zealand","customer_group":"Other","categories":"","phone":"080 027 4438","email":"sales@renovationwarehouse.co.nz","call_note":"","last_call":"2024-04-16","call_interval":42,"urgency":"overdue","latitude":-35.741097,"longitude":174.332738,"portatour_id":"84b25cf8e52749a88c37d098993f8d02"},{"external_id":"1982","name":"Bunnings Whangarei","street":"124 Tauroa Street","city":"WHANGAREI","zip":"140","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"09 470 2100","email":"specialorders.whangarei@bunnings.co.nz","call_note":"Training. Armorsteel.","last_call":"2026-07-16","call_interval":45,"urgency":"not due","latitude":-35.75194,"longitude":174.307118,"portatour_id":"d645ebfd0e404f48a86ea190609af911"},{"external_id":"1988","name":"Carters Dargaville","street":"2 Normanby Street","city":"DARGAVILLE","zip":"310","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 439 3099","email":"Simon.Parkinson@carters.co.nz","call_note":"","last_call":"2026-02-10","call_interval":180,"urgency":"due","latitude":-35.943732,"longitude":173.866057,"portatour_id":"421c06e633184d89bc2ef9a74601bdff"},{"external_id":"2005","name":"Carters Maungaturoto","street":"186 Hurndall Street","city":"MAUNGATUROTO","zip":"0520","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 431 8575","email":"Brian.Roberts@carters.co.nz","call_note":"Meet and Greet","last_call":"2025-08-28","call_interval":180,"urgency":"overdue","latitude":-36.111712,"longitude":174.352409,"portatour_id":"8dbea90844ff450eb6999195b7310474"},{"external_id":"2029","name":"Carters Warkworth","street":"43 Auckland Rd","city":"WARKWORTH","zip":"910","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 425 7879","email":"","call_note":"PA Door Sample","last_call":"2026-02-12","call_interval":180,"urgency":"due","latitude":-36.407398,"longitude":174.65832,"portatour_id":"e5e3a65ffa094d52b10ec896b1a403db"},{"external_id":"2116","name":"Placemakers Kaitaia","street":"41 Matthews Avenue","city":"KAITAIA","zip":"410","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 408 9020","email":"Sharon.Norman@placemakers.co.nz","call_note":"PA Door Sample","last_call":"2026-07-14","call_interval":120,"urgency":"not due","latitude":-35.110348,"longitude":173.26301,"portatour_id":"486ddd426bdc4ed0b84bcd03e52bda91"},{"external_id":"2158","name":"Placemakers Whangarei","street":"8 Kioreroa Road","city":"WHANGAREI","zip":"110","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 470 3970","email":"Walter.wyatt@placemakers.co.nz","call_note":"Establish Contact, sort Display","last_call":"2026-03-31","call_interval":120,"urgency":"due","latitude":-35.740074,"longitude":174.333692,"portatour_id":"c4d6961740424d779fc1f5ef1d3ace10"},{"external_id":"2353","name":"ITM Dargaville","street":"40 - 42 Normandy Street","city":"DARGAVILLE","zip":"310","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 439 8730","email":"brett@dargavilleitm.co.nz","call_note":"","last_call":"2026-02-10","call_interval":180,"urgency":"due","latitude":-35.941591,"longitude":173.868285,"portatour_id":"b00bfab2411c44eab5d4b94b594fdfde"},{"external_id":"2384","name":"ITM Matakana Building Centre","street":"58 Matakana Valley Rd","city":"WARKWORTH","zip":"985","country":"New Zealand","customer_group":"ITM","categories":"C","phone":"09 422 7024","email":"james@matakanaitm.co.nz","call_note":"PA Door Sample","last_call":"2026-01-14","call_interval":120,"urgency":"overdue","latitude":-36.350503,"longitude":174.715394,"portatour_id":"abc0b17daadd4638bc300c4b976ca3aa"},{"external_id":"2418","name":"ITM Waipu","street":"40 Cove Road","city":"WAIPU","zip":"510","country":"New Zealand","customer_group":"ITM","categories":"C","phone":"09 432 0203","email":"nick@waipuitm.co.nz","call_note":"PA Doors, Armorsteel","last_call":"2026-04-01","call_interval":120,"urgency":"due","latitude":-35.985856,"longitude":174.452146,"portatour_id":"c43a4d9e6b9345e99ae5a07be180d611"},{"external_id":"2505","name":"Mitre 10 Mega Whangarei","street":"46 Porowini Avenue","city":"WHANGAREI","zip":"110","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 430 4009","email":"Dee.Field@mitre10.co.nz","call_note":"Training","last_call":"2026-07-08","call_interval":45,"urgency":"not due","latitude":-35.7322,"longitude":174.321731,"portatour_id":"d956e33976af4089bdb0888a64a5d58a"},{"external_id":"4330","name":"Hammer Hardware Kamo","street":"485 Kamo Road","city":"WHANGAREI","zip":"112","country":"New Zealand","customer_group":"Hammer Hardware","categories":"C","phone":"09 435 1342","email":"kamo@hammerhardware.co.nz","call_note":"Meet Wayne and John, get contact details","last_call":"2024-10-02","call_interval":120,"urgency":"overdue","latitude":-35.684132,"longitude":174.301343,"portatour_id":"082c2f14df0b47468edbe7b17fe74fbf"},{"external_id":"4352","name":"Hammer Hardware Waipu","street":"35 The Centre","city":"WAIPU","zip":"510","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"09 432 0292","email":"waipu.office@hammerhardware.co.nz","call_note":"Greens Brochure/Carts. Aromachef.","last_call":"2026-04-01","call_interval":180,"urgency":"not due","latitude":-35.984401,"longitude":174.445643,"portatour_id":"9ae3210399854338b98eb97dbddbafb2"},{"external_id":"8397","name":"ITM Warkworth","street":"16 State Highway 1","city":"WARKWORTH","zip":"0981","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"094251021","email":"brett@warkworthitm.co.nz","call_note":"Follow up Dan re A/S","last_call":"2026-05-13","call_interval":180,"urgency":"not due","latitude":-36.391023,"longitude":174.649543,"portatour_id":"f115f3fb72ec412d953437c8ed96dba7"},{"external_id":"9129","name":"Bay of Islands ITM Waipapa","street":"411 Waipapa Road","city":"Kerikeri","zip":"0295","country":"New Zealand","customer_group":"ITM","categories":"C","phone":"09 407 8002","email":"sales-waipapa@bayofislandsitm.co.nz","call_note":"Armorsteel","last_call":"2026-03-31","call_interval":120,"urgency":"due","latitude":-35.206202,"longitude":173.918612,"portatour_id":"da850bede2364050adc67f85bacc2b92"},{"external_id":"4315","name":"Hammer Hardware Coopers Beach","street":"241 State Highway 10","city":"MANGONUI","zip":"420","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"09 406 1088","email":"coopersbeach@hammerhardware.co.nz","call_note":"Greens Brochure","last_call":"2025-11-04","call_interval":180,"urgency":"overdue","latitude":-34.992681,"longitude":173.504551,"portatour_id":"f1163eb4e45f4a72a47b764bdeca3c1c"},{"external_id":"2451","name":"Mitre 10 McCarthny Kaitaia","street":"1 North Park Drive","city":"KAITAIA","zip":"482","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"09 408 1660","email":"mccarthny@mitre10.co.nz","call_note":"Confirm Display Shed","last_call":"2026-01-13","call_interval":90,"urgency":"overdue","latitude":-35.097111,"longitude":173.260993,"portatour_id":"cf24c12f00a6461f8a84692a939a5a92"},{"external_id":"8368","name":"Mitre 10 Kerikeri","street":"37 Klinac Lane","city":"Kerikeri","zip":"0295","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"09-407 5540","email":"shuna.watts@mitre10.co.nz","call_note":"Mark re Armorsteel, pic of card rack, Karl re Loadshifters","last_call":"2026-07-15","call_interval":90,"urgency":"not due","latitude":-35.210932,"longitude":173.917034,"portatour_id":"4b7a8953a7454e57bbd967961d6c67eb"},{"external_id":"1017","name":"Arnold Franks Ltd","street":"112-114 Cameron Street","city":"WHANGAREI","zip":"0110","country":"New Zealand","customer_group":"Other","categories":"D","phone":"09 438 1359","email":"admin@arnoldfranks.co.nz","call_note":"","last_call":"2024-10-02","call_interval":180,"urgency":"overdue","latitude":-35.727455,"longitude":174.323294,"portatour_id":"12ea8ef24ee044ed8d28da4d163208a9"},{"external_id":"1032","name":"Bream Bay Merchants","street":"Cnr Sime & Kepa Roads","city":"RUAKAKA","zip":"0151","country":"New Zealand","customer_group":"Other","categories":"D","phone":"09 433 0077","email":"info@breambaymerchants.co.nz","call_note":"Meet Dave","last_call":"2024-08-27","call_interval":180,"urgency":"overdue","latitude":-35.8732,"longitude":174.46152,"portatour_id":"8ca69bdb661746d0af5cdf1e321a2fec"},{"external_id":"1251","name":"Buildlink Head Office: Toots Timber & Hardware","street":"91 Waiotoi Rd","city":"WHANGAREI","zip":"0173","country":"New Zealand","customer_group":"Buildlink","categories":"D","phone":"09 434 3171","email":"toots@buildlink.co.nz","call_note":"","last_call":"2024-04-17","call_interval":180,"urgency":"overdue","latitude":-35.620349,"longitude":174.50359,"portatour_id":"1fc39aeb387a4557aa434a507cc9ba44"},{"external_id":"1948","name":"Bunnings Waipapa","street":"391 Waipapa Road","city":"Waipapa","zip":"0295","country":"New Zealand","customer_group":"Bunnings","categories":"C","phone":"09 407 7421","email":"kerikeri@bunnings.co.nz","call_note":"Training in lifestyles, armorsteel appt w/ Trade","last_call":"2026-07-08","call_interval":120,"urgency":"not due","latitude":-35.205816,"longitude":173.920428,"portatour_id":"f5dcdd5050b1459daacfd81e98a2bca7"},{"external_id":"1999","name":"Carters Kaitaia","street":"Dunn Street","city":"KAITAIA","zip":"410","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 408 6170","email":"Rex.Morland@carters.co.nz","call_note":"Armorsteel","last_call":"2026-01-13","call_interval":180,"urgency":"due","latitude":-35.110718,"longitude":173.265682,"portatour_id":"9cd882db03324783a5f21289de6d2b21"},{"external_id":"2001","name":"Carters Kerikeri","street":"Cnr Kahikatearoa Lane & SH 10","city":"KERIKERI","zip":"295","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 407 6609","email":"Natalia.Hill@carters.co.nz","call_note":"Meet with Michael re armorsteel","last_call":"2026-02-10","call_interval":180,"urgency":"due","latitude":-35.212067,"longitude":173.919793,"portatour_id":"51e420fc2d3941cb85259b8ac830dbc9"},{"external_id":"2003","name":"Carters Mangawhai","street":"41 Moir Street","city":"MANGAWHAI","zip":"505","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 423 1180","email":"","call_note":"Establish shed contact, workshops","last_call":"2024-10-03","call_interval":180,"urgency":"overdue","latitude":-36.125858,"longitude":174.5756,"portatour_id":"5ea934ea5f9e4b9fab186b30b917a703"},{"external_id":"2034","name":"Carters Whangarei","street":"32 Commerce Street","city":"WHANGAREI","zip":"110","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 438 3659","email":"Lio.Tua@carters.co.nz","call_note":"Catch up with Calvin Re Armorsteel","last_call":"2026-02-11","call_interval":180,"urgency":"due","latitude":-35.730406,"longitude":174.324395,"portatour_id":"d8723b9e5e5f4eb280487e550f27d947"},{"external_id":"2119","name":"Placemakers Kerikeri","street":"26 Mill Lane","city":"KERIKERI","zip":"230","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 407 4820","email":"kerikeri@placemakers.co.nz","call_note":"Lifestyle Signage","last_call":"2026-03-31","call_interval":120,"urgency":"due","latitude":-35.234603,"longitude":173.951542,"portatour_id":"1bc16345e3ad4e7092acfe75b4cb7e85"},{"external_id":"2341","name":"ITM Bay Of Islands","street":"2 Haruru Falls Road","city":"PAIHIA","zip":"204","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 402 7703","email":"murry.n@bayitm.co.nz","call_note":"Display shed opportunity","last_call":"2025-07-02","call_interval":180,"urgency":"overdue","latitude":-35.28018,"longitude":174.050302,"portatour_id":"b3b8882dcbee4233a1aa72e364c26fad"},{"external_id":"2358","name":"ITM Far North Mangonui","street":"22 Karamea Road","city":"NORTHLAND","zip":"442","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 406 0048","email":"danielle@fnitm.co.nz","call_note":"","last_call":"2024-08-29","call_interval":180,"urgency":"overdue","latitude":-35.0968971319237,"longitude":173.260906419169,"portatour_id":"d776d74ab3ac4a7f8feda73266cd6123"},{"external_id":"2374","name":"ITM Far North Kaitaia","street":"23 Northpark Drive","city":"KAITAIA","zip":"0410","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 408 3927","email":"danielle@fnitm.co.nz","call_note":"","last_call":"2025-10-02","call_interval":180,"urgency":"overdue","latitude":-35.1117,"longitude":173.262,"portatour_id":"16e4936988514fe0803f616cbf8f2e93"},{"external_id":"2502","name":"Mitre 10 Mega Warkworth","street":"Cnr Woodcocks & Mansell Drive","city":"WARKWORTH","zip":"910","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 425 8119","email":"purchasing@megawarkworth.co.nz","call_note":"Greens area in GC (Whangarei ideas?). Meet with Jordan re armorsteel","last_call":"2026-05-13","call_interval":45,"urgency":"overdue","latitude":-36.3976,"longitude":174.666,"portatour_id":"296315137af54f8db04daa940c6195cc"},{"external_id":"8395","name":"ITM Mangawhai","street":"188 Molesworth Drive","city":"","zip":"0505","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"094314963","email":"simon@warkworthitm.co.nz","call_note":"Greens opportunities","last_call":"2026-04-01","call_interval":180,"urgency":"not due","latitude":-36.102508,"longitude":174.586377,"portatour_id":"318a34b364ad43dc824ae30590a08464"},{"external_id":"2507","name":"Mitre 10 Whangaparaoa","street":"26 Karepiro Drive","city":"AUCKLAND","zip":"932","country":"New Zealand","customer_group":"Mitre 10","categories":"D","phone":"09 428 2477","email":"wgp@mitre10.co.nz","call_note":"Hygiene, Concrete, Plan for brochure holders/signage in trade.","last_call":"2026-01-15","call_interval":180,"urgency":"due","latitude":-36.635141,"longitude":174.737378,"portatour_id":"f862950926e342efa3e691b6c516cd85"},{"external_id":"2121","name":"Placemakers Mangawhai","street":"4 Moir Point Road","city":"MANGAWHAI HEADS","zip":"505","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"09 431 4236","email":"wendy.kerr@placemakers.co.nz","call_note":"displays, training.","last_call":"2026-02-12","call_interval":180,"urgency":"due","latitude":-36.101288,"longitude":174.588435,"portatour_id":"998e5063a87d400fa023b2333cdc5ddc"},{"external_id":"9328","name":"Placemakers Warkworth","street":"64 Morrison Drive","city":"WARKWORTH","zip":"0910","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"","email":"p488epo@placemakers.co.nz","call_note":"Appt with Paul Kerr *Not Confirmed*","last_call":"2026-05-13","call_interval":180,"urgency":"not due","latitude":-36.411309,"longitude":174.654119,"portatour_id":"6e030ee82d7a41429e5652c1613a6998"},{"external_id":"9095","name":"Buildlink Kaitaia","street":"374 State Highway 1","city":"","zip":"","country":"New Zealand","customer_group":"Buildlink","categories":"E","phone":"027 484 3869","email":"angela@buildlinkkaitaia.co.nz","call_note":"Lifestyle Signage","last_call":"2024-11-13","call_interval":42,"urgency":"not due","latitude":-35.09588355346075,"longitude":173.25755938450288,"portatour_id":"1bd68da47ca84ee68119d2cdd2344138"},{"external_id":"","name":"Mitre 10 Mega Silverdale","street":"35 Colin Chester Drive","city":"Silverdale","zip":"0932","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"","phone":"","email":"","call_note":"Training On Tues or Wed","last_call":"2026-05-13","call_interval":42,"urgency":"overdue","latitude":-36.611901,"longitude":174.664964,"portatour_id":"eb32e90dcf604beb96ba8dacd1b54d48"},{"external_id":"","name":"Bunnings Mangawhai","street":"75A Molesworth Drive","city":"Mangawhai","zip":"0505","country":"NZ","customer_group":"Bunnings","categories":"C","phone":"","email":"","call_note":"Tidy up Shed Stock","last_call":"2026-04-01","call_interval":120,"urgency":"due","latitude":-36.11373457695712,"longitude":174.57498796534128,"portatour_id":"0e19d894f8054b01aa0ab3ee573a5295"},{"external_id":"4316","name":"Hammer Hardware Devonport","street":"13 Clarence Street","city":"AUCKLAND","zip":"0624","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"09 445 2356","email":"devonport@hammerhardware.co.nz","call_note":"Check to see how Gardenpros and Charcoal are going","last_call":"2024-12-17","call_interval":180,"urgency":"overdue","latitude":-36.83036,"longitude":174.796549,"portatour_id":"94a7c8f039e24be1bf1ea4e1c0a3a294"},{"external_id":"9134","name":"Bunnings Westgate","street":"21 Fred Taylor Drive","city":"AUCKLAND","zip":"0814","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"","email":"Westgate@bunnings.co.nz","call_note":"Armorsteel, Brochure/pricelist swap out, solvent for sheds","last_call":"2026-04-09","call_interval":45,"urgency":"overdue","latitude":-36.821275,"longitude":174.607913,"portatour_id":"5a0fcc51708c49b3816e30be3bf6e6a6"},{"external_id":"1929","name":"Bunnings Avondale Trade Centre","street":"494 Rosebank Road","city":"AUCKLAND","zip":"1026","country":"New Zealand","customer_group":"Bunnings","categories":"D","phone":"09 828 0600","email":"trade.avondaletrade@bunnings.co.nz","call_note":"Armorsteel, Shed Sales numbers discussion","last_call":"2026-04-08","call_interval":180,"urgency":"not due","latitude":-36.879261,"longitude":174.67153,"portatour_id":"ff1e7ea055094096b2e09c3c26dfa63c"},{"external_id":"2354","name":"Dayle ITM Avondale","street":"729 Rosebank Rd","city":"AUCKLAND","zip":"1026","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 828 9791","email":"governance@dayleitm.co.nz","call_note":"Armorsteel","last_call":"2026-04-08","call_interval":180,"urgency":"not due","latitude":-36.871267,"longitude":174.671311,"portatour_id":"8514eeb3e97647cf882afbec61320bbe"},{"external_id":"1957","name":"Bunnings New Lynn","street":"Bunnings New Lynn","city":"AUCKLAND","zip":"600","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"09 826 2400","email":"newlynn@bunnings.co.nz","call_note":"Fix Armorsteel stickers, Flashing layout, A/S order forms","last_call":"2026-04-08","call_interval":45,"urgency":"overdue","latitude":-36.9137,"longitude":174.681,"portatour_id":"f222a7bdcf054c50b0f482d3e9de0f02"},{"external_id":"2467","name":"Mitre 10 Mega New Lynn","street":"5 Astley Avenue","city":"AUCKLAND","zip":"600","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 826 1420","email":"Cam.Caithness@mitre10.co.nz","call_note":"Wheelbarrow Stickers, Cedar protectant, Poly Cart discussion","last_call":"2026-04-08","call_interval":45,"urgency":"overdue","latitude":-36.912345,"longitude":174.688295,"portatour_id":"217eafdac7914f90aa20a1c84a00bc53"},{"external_id":"1996","name":"Carters Henderson","street":"141 Central Park Drive","city":"AUCKLAND","zip":"610","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 837 8796","email":"jamie.bonner@carters.co.nz","call_note":"Loadshifters, greens parts, and/or Carts?","last_call":"2025-02-27","call_interval":180,"urgency":"overdue","latitude":-36.853148,"longitude":174.636405,"portatour_id":"8e6ed6c55dbb4b98b94099d34f545518"},{"external_id":"2379","name":"ITM MacClures Timber","street":"256 Swanson Rd","city":"AUCKLAND","zip":"610","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 8360414","email":"mactim@xtra.co.nz","call_note":"Loadshifters, greens parts, and/or Carts?","last_call":"2025-10-29","call_interval":180,"urgency":"overdue","latitude":-36.864328,"longitude":174.614964,"portatour_id":"9e322ef839fd47218ee1a5d359ece779"},{"external_id":"2446","name":"Mitre 10 Mega Henderson","street":"186 Lincoln Rd","city":"AUCKLAND","zip":"610","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 836 7700","email":"alasdair.mega@mitre10.co.nz","call_note":"Clear Brochure Holder, Display F/U, Training w/ Trade","last_call":"2026-04-09","call_interval":45,"urgency":"overdue","latitude":-36.858522,"longitude":174.629736,"portatour_id":"b1aad098effd428e8589ef33712bed9a"},{"external_id":"2404","name":"ITM Western Swanson","street":"2 O\'Neills Road","city":"AUCKLAND","zip":"612","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 832 0209","email":"shaneb@westernitm.co.nz","call_note":"Armorsteel","last_call":"2026-04-08","call_interval":42,"urgency":"not due","latitude":-36.865792,"longitude":174.585926,"portatour_id":"3bc723afeafd495e89172eb39e161116"},{"external_id":"2156","name":"Placemakers Westgate","street":"547 - 557 Don Buck Road","city":"AUCKLAND","zip":"614","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 815 6800","email":"ruth.thornewell@placemakers.co.nz","call_note":"A/S Follow up, Loadshifters, greens parts, and/or Carts?","last_call":"2026-04-09","call_interval":120,"urgency":"due","latitude":-36.822775,"longitude":174.607558,"portatour_id":"5a2eae27847f41f0805552c4a0ab5c18"},{"external_id":"1938","name":"Bunnings Glenfield","street":"80 Wairau Road","city":"AUCKLAND","zip":"627","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"09 443 8891","email":"specialorders.glenfield@bunnings.co.nz","call_note":"New member training, Armorsteel, Sheds planogram","last_call":"2026-02-25","call_interval":45,"urgency":"overdue","latitude":-36.776805,"longitude":174.744017,"portatour_id":"8782834412c94f40bbc43eb2bcdfa6fa"},{"external_id":"1993","name":"Carters Glenfield","street":"66 Diana Drive","city":"AUCKLAND","zip":"627","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 441 2333","email":"greg.cross@carters.co.nz","call_note":"Armorsteel","last_call":"2024-09-12","call_interval":180,"urgency":"overdue","latitude":-36.773815,"longitude":174.73484,"portatour_id":"898a4de217f24e1abfaa84c1395ce51b"},{"external_id":"2440","name":"Mitre 10 Mega Glenfield","street":"15 Poland Rd","city":"AUCKLAND","zip":"627","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 440 5100","email":"pbritton@grove.co.nz","call_note":"Inventory Contact email, Sliding door fix, new display layout","last_call":"2026-03-10","call_interval":45,"urgency":"overdue","latitude":-36.77691,"longitude":174.740855,"portatour_id":"7003e3ed4a454d118bd660bb56af9561"},{"external_id":"2153","name":"Placemakers Wairau Park (Glenfield)","street":"3 Link Drive","city":"AUCKLAND","zip":"627","country":"New Zealand","customer_group":"Placemakers","categories":"B","phone":"09 444 5155","email":"orders.wairaupark@placemakers.co.nz","call_note":"Appt with Bob/Paul re display","last_call":"2025-07-23","call_interval":90,"urgency":"overdue","latitude":-36.768083,"longitude":174.737987,"portatour_id":"cc1a3c0e3fc943119e6f40c83365766a"},{"external_id":"1959","name":"Bunnings North Shore","street":"15 Home Place","city":"AUCKLAND","zip":"632","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"09 978 2400","email":"northshore@bunnings.co.nz","call_note":"Training, Flashing Layout","last_call":"2026-03-10","call_interval":45,"urgency":"overdue","latitude":-36.749236,"longitude":174.727416,"portatour_id":"5d0cea9560d14742ae3aaeb339e93937"},{"external_id":"1983","name":"Carters Albany","street":"10 Tawa Drive","city":"AUCKLAND","zip":"632","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"09 415 7171","email":"","call_note":"","last_call":"2024-12-17","call_interval":180,"urgency":"overdue","latitude":-36.739141,"longitude":174.716763,"portatour_id":"6f97c1a3d85a4dc6b85fe12e55d7a2f7"},{"external_id":"2336","name":"ITM Albany","street":"66 Bush Road","city":"AUCKLAND","zip":"632","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 415 6889","email":"trobinson@albanytimber.co.nz","call_note":"Recap/Feedback from David","last_call":"2025-11-20","call_interval":180,"urgency":"overdue","latitude":-36.738197,"longitude":174.703778,"portatour_id":"aa7d8678587b45fc9bb5abe18ab8e0df"},{"external_id":"2426","name":"Mitre 10 Mega Albany","street":"260 Oteha Valley Road","city":"AUCKLAND","zip":"632","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 442 6130","email":"ap@meganewlynn.co.nz","call_note":"Mini shed installation, signage relocation","last_call":"2026-03-10","call_interval":45,"urgency":"overdue","latitude":-36.721697,"longitude":174.706474,"portatour_id":"48fdb5b53b4b4acd8e4ed5142e16d9f5"},{"external_id":"2095","name":"Placemakers Albany","street":"24 Oteha Valley Road Ext","city":"AUCKLAND","zip":"632","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 414 0900","email":"sandra.teal@placemakers.co.nz","call_note":"Establish Contact, Armorsteel.","last_call":"2026-02-25","call_interval":120,"urgency":"overdue","latitude":-36.724921,"longitude":174.698086,"portatour_id":"bceaa53fde8c4f63b9807109e3caa29f"},{"external_id":"2129","name":"Placemakers New Lynn","street":"6 Crown Lynn Place","city":"AUCKLAND","zip":"640","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"09 825 0088","email":"p479epo@placemakers.co.nz","call_note":"Review WB Range with Shaun.","last_call":"2026-04-08","call_interval":120,"urgency":"due","latitude":-36.910905,"longitude":174.685005,"portatour_id":"3c014bee61b941dba9b93ce9878adec6"},{"external_id":"2369","name":"ITM Hillside Bldg Supplies 2019 (Glenfield)","street":"131 Diana Drive","city":"AUCKLAND","zip":"67","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 443 8101","email":"smcnally@hbs.co.nz","call_note":"Armorsteel","last_call":"2024-09-12","call_interval":180,"urgency":"overdue","latitude":-36.773732,"longitude":174.735121,"portatour_id":"9d54c1426db74bc4b53bd65d620b4137"},{"external_id":"2503","name":"Mitre 10 Mega Westgate","street":"Northside Drive","city":"AUCKLAND","zip":"7473","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"09 416 2400","email":"damien.clarke@mitre10.co.nz","call_note":"cedar shed to be painted.","last_call":"2026-04-09","call_interval":45,"urgency":"overdue","latitude":-36.80934806520541,"longitude":174.60491165105847,"portatour_id":"aa42568982a7444aae29f194925bd5c2"},{"external_id":"2445","name":"Mitre 10 Helensville H&T","street":"41 Mill Road","city":"AUCKLAND","zip":"800","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"09 420 8153","email":"helensville@mitre10.co.nz","call_note":"Hygiene, 2.5 and 3kg.","last_call":"2026-01-15","call_interval":120,"urgency":"overdue","latitude":-36.679152,"longitude":174.445807,"portatour_id":"03cce2207657481faecc301fb3707228"},{"external_id":"2377","name":"ITM Western Kumeu","street":"154 Main Rd","city":"AUCKLAND","zip":"810","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 412 8148","email":"wendyf@westernitm.co.nz","call_note":"Get Elvins contact","last_call":"2026-04-09","call_interval":180,"urgency":"not due","latitude":-36.774483,"longitude":174.552143,"portatour_id":"2b5ebda14164497688dfd5fe4b1f73eb"},{"external_id":"2424","name":"ITM Western Whenuapai","street":"2 Airport Road","city":"AUCKLAND","zip":"816","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"09 416 8164","email":"lyndonf@westernitm.co.nz","call_note":"Armorsteel","last_call":"2026-04-09","call_interval":180,"urgency":"not due","latitude":-36.793403,"longitude":174.617119,"portatour_id":"8445c43bbcd04c38bc51a485294c5874"},{"external_id":"2473","name":"Mitre 10 KJ Pahiatua","street":"67 Main Street","city":"PAHIATUA","zip":"4910","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"06 376 7978","email":"kj@mitre10.co.nz","call_note":"","last_call":"2026-02-19","call_interval":120,"urgency":"overdue","latitude":-40.451283,"longitude":175.842498,"portatour_id":"74a5fd0c92fa4439b4c699ef47a42273"},{"external_id":"2382","name":"ITM Central Marton","street":"40 Racecourse Ave","city":"MARTON","zip":"4710","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 327 5458","email":"rjames@centralitm.co.nz","call_note":"Signage","last_call":"2026-07-22","call_interval":180,"urgency":"not due","latitude":-40.086131,"longitude":175.393964,"portatour_id":"65f32af55e8d44bfa480576466152d5d"},{"external_id":"2381","name":"ITM Manawatu Timber & Hardware","street":"51 Joseph Street","city":"PALMERSTON NORTH","zip":"4412","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 356 9490","email":"darren@manawatuitm.co.nz","call_note":"PA Doors","last_call":"2026-07-22","call_interval":180,"urgency":"not due","latitude":-40.36288,"longitude":175.603001,"portatour_id":"b77821ca053349c28615b049f70ecf1f"},{"external_id":"2360","name":"ITM Hometown Building Supplies Foxton","street":"1 Bergin Road","city":"FOXTON","zip":"4814","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 363 8049","email":"doug@hometownitm.co.nz","call_note":"Hammer Hardware opening EOY, can call then","last_call":"2026-02-18","call_interval":180,"urgency":"due","latitude":-40.463074,"longitude":175.280547,"portatour_id":"d4dfff3b8ea94eec8a62eceb110288ff"},{"external_id":"1103","name":"Hall of Flame","street":"290 Oxford Street","city":"LEVIN","zip":"5510","country":"New Zealand","customer_group":"Other","categories":"E","phone":"06 3670760","email":"sales@hallofflame.co.nz","call_note":"","last_call":"","call_interval":42,"urgency":"overdue","latitude":-40.620116,"longitude":175.288386,"portatour_id":"b3741e528e574e02b31c792b44e15faa"},{"external_id":"2457","name":"Mitre 10 McIlwaine - Marton","street":"35 Russell Street","city":"MARTON","zip":"4710","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"06 327 7079","email":"terry@mcilwaine.co.nz","call_note":"","last_call":"2026-07-22","call_interval":120,"urgency":"not due","latitude":-40.074408,"longitude":175.371936,"portatour_id":"813a02a5133841bc9e09b4082b8c2cf7"},{"external_id":"2347","name":"ITM Crighton Levin","street":"15 - 19 Hokio Beach Rd","city":"LEVIN","zip":"5510","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 368 4057","email":"rachel@crightons.co.nz","call_note":"","last_call":"2026-02-18","call_interval":180,"urgency":"due","latitude":-40.632289,"longitude":175.27377,"portatour_id":"de7e661eb6e147359ebe818b00f175f1"},{"external_id":"1979","name":"Bunnings Wellington Central","street":"Bunnings Wellington Central","city":"WELLINGTON","zip":"6011","country":"New Zealand","customer_group":"Bunnings","categories":"D","phone":"04 805 0593","email":"specialorders.wellingtoncentral@bunnings.co.nz","call_note":"","last_call":"2026-04-16","call_interval":180,"urgency":"not due","latitude":-41.2851,"longitude":174.776001,"portatour_id":"e2abdafe4125425081dfef31327c1a5b"},{"external_id":"1284","name":"Wellington BBQ & Fire","street":"12 Te Puni Street","city":"LOWER HUTT","zip":"5012","country":"New Zealand","customer_group":"Other","categories":"C","phone":"04 5669714","email":"miramar@bbqsandfire.co.nz","call_note":"","last_call":"2023-07-25","call_interval":120,"urgency":"overdue","latitude":-41.224179,"longitude":174.869039,"portatour_id":"b293bb4f289c4f1b9e0b21030d86da36"},{"external_id":"9463","name":"Kapiti Woodfires","street":"128 Rimu Road","city":"","zip":"","country":"New Zealand","customer_group":"Other","categories":"D","phone":"042125509","email":"admin@kapitiwoodfires.co.nz","call_note":"","last_call":"2022-12-06","call_interval":180,"urgency":"overdue","latitude":-40.89446193272943,"longitude":174.98440958000415,"portatour_id":"4ecc6f2ddce84dce8308d5088d4b5fa1"},{"external_id":"2435","name":"Mitre 10 Dannevirke","street":"155-163 High Street","city":"DANNEVIRKE","zip":"4930","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"06 374 6045","email":"dannevirke@mitre10.co.nz","call_note":"Create appt with Jesse","last_call":"2026-02-19","call_interval":120,"urgency":"overdue","latitude":-40.208132,"longitude":176.101915,"portatour_id":"4076b14a41b249fc87f32d995abef328"},{"external_id":"2152","name":"Placemakers Wairarapa","street":"72 Ngaumutawa Road","city":"MASTERTON","zip":"5810","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"","email":"Kate.Ryan@placemakers.co.nz","call_note":"Display solution, Armorsteel","last_call":"2026-04-14","call_interval":120,"urgency":"due","latitude":-40.941765,"longitude":175.644471,"portatour_id":"d72f7d75553a41c089bc9291a4977ad9"},{"external_id":"2438","name":"Mitre 10 Darraghs Feilding","street":"44 Kimbolton Road","city":"FEILDING","zip":"4702","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"06 323 4054","email":"darraghs@mitre10.co.nz","call_note":"Get some sort of action on the displays","last_call":"2026-06-17","call_interval":120,"urgency":"not due","latitude":-40.226661,"longitude":175.563507,"portatour_id":"4bb23eb5295a4893ad4f41191fbe4660"},{"external_id":"2474","name":"Mitre 10 Mega Palmerston North","street":"250-270 Featherston Street","city":"PALMERSTON NORTH","zip":"4414","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"06 354 4087","email":"palmerstonnorth@mitre10.co.nz","call_note":"Establish Trade contact, Seasonal Opportunities","last_call":"2026-07-21","call_interval":45,"urgency":"not due","latitude":-40.349593,"longitude":175.60695,"portatour_id":"a66adb731997439293abef70311b9e2a"},{"external_id":"2134","name":"Placemakers Palmerston North","street":"Cnr Railway Rd & Francis Way","city":"PALMERSTON NORTH","zip":"4414","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"06 353 5777","email":"sales.palmerston@placemakers.co.nz","call_note":"PA Doors/Flashings","last_call":"2026-07-22","call_interval":180,"urgency":"not due","latitude":-40.328117,"longitude":175.627746,"portatour_id":"efceb4be3ef7423594f2ba45229ac26e"},{"external_id":"1961","name":"Bunnings Palmerston North","street":"23 Railway Road","city":"PALMERSTON NORTH","zip":"4410","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"06 355 7100","email":"palmerstonnorth@bunnings.co.nz","call_note":"Double Check Barrow stock as per last call, Armorsteel","last_call":"2026-07-22","call_interval":45,"urgency":"not due","latitude":-40.329274,"longitude":175.629068,"portatour_id":"fecc86c728b94df68c140df5fa361bad"},{"external_id":"2013","name":"Carters Palmerston North","street":"69 Railway Road","city":"PALMERSTON NORTH","zip":"4414","country":"New Zealand","customer_group":"Carters","categories":"D","phone":"06 358 9029","email":"","call_note":"","last_call":"2026-07-22","call_interval":180,"urgency":"not due","latitude":-40.326644,"longitude":175.626028,"portatour_id":"c2c92a91b75042f889617b3cf51ed38e"},{"external_id":"2359","name":"ITM Central Feilding","street":"1537 Waughs Road","city":"FEILDING","zip":"4775","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 323 3400","email":"rjames@centralitm.co.nz","call_note":"","last_call":"2026-02-04","call_interval":180,"urgency":"due","latitude":-40.236214,"longitude":175.575343,"portatour_id":"9467e7ccecfc4fe394eba3a2f773df2c"},{"external_id":"1935","name":"Bunnings Feilding","street":"15 Eyre Street","city":"FEILDING","zip":"4702","country":"New Zealand","customer_group":"Bunnings","categories":"B","phone":"06 323 6581","email":"feilding@bunnings.co.nz","call_note":"Check Steel status. Brochure holders Low Pri","last_call":"2026-01-27","call_interval":90,"urgency":"overdue","latitude":-40.227346,"longitude":175.567828,"portatour_id":"d4205e8c66ae40f7a9da197e28efeb13"},{"external_id":"2453","name":"Mitre 10 Levin","street":"521 Queen Street","city":"LEVIN","zip":"5510","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"06 368 2268","email":"levin@mitre10.co.nz","call_note":"Sort Display Sheds, training in trade","last_call":"2026-06-17","call_interval":90,"urgency":"not due","latitude":-40.632093,"longitude":175.279621,"portatour_id":"994e0a650e0141b091481f59d3dd8f77"},{"external_id":"2120","name":"Placemakers Levin","street":"23 South Road","city":"Levin","zip":"5510","country":"NZ","customer_group":"Placemakers","categories":"C","phone":"06 368 9189","email":"gaitchison@placemakers.co.nz","call_note":"","last_call":"2026-02-18","call_interval":120,"urgency":"overdue","latitude":-40.63498069203244,"longitude":175.27335043191087,"portatour_id":"355ddf2dc92742adbad04bf1e3f40430"},{"external_id":"4339","name":"Hammer Hardware Otaki","street":"Titoki Street","city":"OTAKI","zip":"5512","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"06 364 8389","email":"otaki@hammerhardware.co.nz","call_note":"Yard/Gardenpro, Firepits","last_call":"2026-02-18","call_interval":180,"urgency":"due","latitude":-40.760266,"longitude":175.136815,"portatour_id":"5603b7ad2bc047c4bebaaba343b75b93"},{"external_id":"2351","name":"Tumu Dannevirke","street":"198 High Street","city":"DANNEVIRKE","zip":"4930","country":"New Zealand","customer_group":"Other","categories":"D","phone":"06 374 4260","email":"jeff.sharp@tumu.co.nz","call_note":"","last_call":"2024-09-06","call_interval":180,"urgency":"overdue","latitude":-40.207105,"longitude":176.105451,"portatour_id":"7c9cb1fd754247d9af07583f8148c16d"},{"external_id":"1949","name":"Bunnings Lyall Bay","street":"24-54 Kingsford-Smith St","city":"WELLINGTON","zip":"6022","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"04 387 3550","email":"specialorders.lyallbay@bunnings.co.nz","call_note":"","last_call":"2026-04-14","call_interval":45,"urgency":"overdue","latitude":-41.325048,"longitude":174.801348,"portatour_id":"a849990316fb45c2b0f82d18a80130e8"},{"external_id":"2106","name":"Placemakers Evans Bay","street":"38 Tacy Street","city":"WELLINGTON","zip":"6022","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"04 387 8692","email":"rzonneveld@placemakers.co.nz","call_note":"Talk to John (BM) Re damaged Garrison Display.","last_call":"2026-04-14","call_interval":180,"urgency":"not due","latitude":-41.315817,"longitude":174.799442,"portatour_id":"c1a542cf71034d5d8ab6b789837b666e"},{"external_id":"2117","name":"Placemakers Kaiwharawhara","street":"188 Hutt Road","city":"WELLINGTON","zip":"6035","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"04 496 1124","email":"manoj.sharma@placemakers.co.nz","call_note":"Signage","last_call":"2026-03-24","call_interval":45,"urgency":"overdue","latitude":-41.255986,"longitude":174.795738,"portatour_id":"576dbcafc33044c9a0f9749b19cd02d9"},{"external_id":"2477","name":"Mitre 10 Mega Petone","street":"25 Bouverie St","city":"PETONE","zip":"","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"04 569 8311","email":"vivian.brandon@mitre10.co.nz","call_note":"Guardian stock, pics for case to Paul re GL75s","last_call":"2026-06-18","call_interval":45,"urgency":"due","latitude":-41.219172,"longitude":174.883749,"portatour_id":"680eef5f19aa47e7ab8fa49530b32ce2"},{"external_id":"1962","name":"Bunnings Petone","street":"47 The Esplanade","city":"LOWER HUTT","zip":"5012","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"04 570 3000","email":"petone@bunnings.co.nz","call_note":"Talk to Coord re steel display, Check deranged Tradesmen etc.","last_call":"2026-04-16","call_interval":45,"urgency":"overdue","latitude":-41.225425,"longitude":174.866418,"portatour_id":"e200ad0232ec4cca8cc367b40343434d"},{"external_id":"2349","name":"ITM Crighton Seaview","street":"123 Hutt Park Road","city":"LOWER HUTT","zip":"5010","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"04 568 3896","email":"phillip@crightonslh.co.nz","call_note":"","last_call":"2026-02-17","call_interval":180,"urgency":"due","latitude":-41.238272,"longitude":174.911814,"portatour_id":"dfe5a2331b8e439cb730236cd52e95f6"},{"external_id":"2113","name":"Placemakers Hutt City","street":"49 Seaview Road","city":"LOWER HUTT","zip":"5010","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"04 568 5042","email":"patrick.duffy@placemakers.co.nz","call_note":"","last_call":"2026-04-16","call_interval":120,"urgency":"due","latitude":-41.2408,"longitude":174.908375,"portatour_id":"157bea128e73436eb1bf0613d7724b5a"},{"external_id":"2433","name":"Mitre 10 Crofton Downs Wgtn","street":"128 Churchill Drive","city":"WELLINGTON","zip":"6035","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"04 479 8765","email":"croftondowns@mitre10.co.nz","call_note":"","last_call":"2026-04-16","call_interval":120,"urgency":"due","latitude":-41.255299,"longitude":174.765679,"portatour_id":"d4d68c99e09046d5ad4c1c5a712b6a17"},{"external_id":"2479","name":"Mitre 10 Mega Porirua","street":"The Mega Shopping Mall","city":"PORIRUA","zip":"5022","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"04 233 8009","email":"jodie.lister@mitre10.co.nz","call_note":"Look at display situation, Guardian stock, pics for case to Paul re GL75s","last_call":"2026-06-18","call_interval":45,"urgency":"due","latitude":-41.131489,"longitude":174.839994,"portatour_id":"5b2b09b4a08f43b2a2da293db9258349"},{"external_id":"2136","name":"Placemakers Porirua","street":"15 John Seddon Drive","city":"PORIRUA","zip":"5022","country":"New Zealand","customer_group":"Placemakers","categories":"D","phone":"04 237 9189","email":"bkenna@placemakers.co.nz","call_note":"Armorsteel","last_call":"2026-03-26","call_interval":360,"urgency":"not due","latitude":-41.135017,"longitude":174.8333,"portatour_id":"3b1efd67dd714592a5055ee0996bd546"},{"external_id":"1963","name":"Bunnings Porirua","street":"9 Heriot Drive","city":"PORIRUA","zip":"5022","country":"New Zealand","customer_group":"Bunnings","categories":"A","phone":"04 978 1300","email":"porirua@bunnings.co.nz","call_note":"","last_call":"2026-04-15","call_interval":45,"urgency":"overdue","latitude":-41.135312,"longitude":174.83709,"portatour_id":"c1750c4038d84d52b3de5b8e3279eef1"},{"external_id":"2408","name":"Toa Building Supplies ITM","street":"17 Prosser Street","city":"Porirua","zip":"5022","country":"New Zealand","customer_group":"ITM","categories":"","phone":"04 232 5999","email":"brian.itmtawa@xtra.co.nz","call_note":"PA Doors/Flashings","last_call":"2024-11-21","call_interval":180,"urgency":"overdue","latitude":-41.133675,"longitude":174.832518,"portatour_id":"3d5197631e6d4f39bf497c6e18d747fa"},{"external_id":"2396","name":"Toa ITM Building Centre","street":"19 Park Street","city":"WELLINGTON","zip":"5140","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"04 527 6800","email":"jmoen@parapine.co.nz","call_note":"Adam re PA Doors","last_call":"2025-11-26","call_interval":180,"urgency":"overdue","latitude":-41.124519,"longitude":175.074516,"portatour_id":"9c8f930595d545bd9c4cd19a764f3086"},{"external_id":"2496","name":"Mitre 10 Mega Upper Hutt","street":"9 Park Street","city":"WELLINGTON","zip":"5018","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"04 527 2227","email":"wayneb@megapetone.co.nz","call_note":"Guardian stock, pics for case to Paul re GL75s","last_call":"2026-06-18","call_interval":45,"urgency":"due","latitude":-41.125767,"longitude":175.074078,"portatour_id":"1f959cd660a347109f2f6865d3c7baeb"},{"external_id":"2456","name":"Mitre 10 Pain & Kershaw","street":"37 - 39 Naples Street","city":"MARTINBOROUGH","zip":"5711","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"06 306 5103","email":"painandkershaw@mitre10.co.nz","call_note":"","last_call":"2026-06-18","call_interval":120,"urgency":"not due","latitude":-41.218561,"longitude":175.457352,"portatour_id":"313c70bafed541ebaba0682fefadebe3"},{"external_id":"2458","name":"Mitre 10 Mega Masterton","street":"157-169 Ngaumutawa Road","city":"MASTERTON","zip":"5840","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"06 370 6888","email":"brent.stewart@mitre10.co.nz","call_note":"Check cart stock, ask about fish smokers, ensure they have sorted their brochure issue.","last_call":"2026-06-17","call_interval":45,"urgency":"due","latitude":-40.947243,"longitude":175.636076,"portatour_id":"ef8fbddf941b4eeaac2cf54c92eb7e6c"},{"external_id":"2383","name":"ITM Tumu Masterton","street":"337 Ngaumutawa Road","city":"MASTERTON","zip":"5810","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 370 6061","email":"corrie.james@tumu.co.nz","call_note":"Establish Contact, Armorsteel.","last_call":"2025-08-05","call_interval":180,"urgency":"overdue","latitude":-40.962079,"longitude":175.612913,"portatour_id":"0ee23c1e87494cd5ac9a08ca6fcdf6bb"},{"external_id":"1986","name":"Central ITM Carterton","street":"37-53 High Street South","city":"CARTERTON","zip":"5713","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 9297598","email":"tom.james@centralitm.co.nz","call_note":"Discuss Display w/ Chris","last_call":"2026-04-14","call_interval":180,"urgency":"not due","latitude":-41.02539,"longitude":175.5271,"portatour_id":"1bbb5ab6a37e4b75b2c87fd57c5e4b29"},{"external_id":"2346","name":"ITM Crighton Greytown","street":"201 Main Street","city":"GREYTOWN","zip":"5712","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"06 304 7193","email":"chris@crightonsgtown.co.nz","call_note":"","last_call":"2026-03-25","call_interval":180,"urgency":"due","latitude":-41.086992,"longitude":175.453091,"portatour_id":"9a4d9c50d36e44c880482ee684a96d54"},{"external_id":"2118","name":"Placemakers Kapiti","street":"16 Lodestar Place","city":"PARAPARAUMU","zip":"5032","country":"New Zealand","customer_group":"Placemakers","categories":"C","phone":"04 298 6199","email":"janne.rowe@placemakers.co.nz","call_note":"Tidy up display, suggest loadshifters","last_call":"2025-11-25","call_interval":120,"urgency":"overdue","latitude":-40.902207,"longitude":174.992882,"portatour_id":"62d0a7a633ba43f79ad771d4ee6d3caf"},{"external_id":"2452","name":"Mitre 10 Mega Kapiti","street":"135 Kapiti Road","city":"PARAPARAUMU","zip":"5032","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"A","phone":"04 296 6440","email":"Vincent.Indo@mitre10.co.nz","call_note":"Training with Garden Team","last_call":"2026-06-18","call_interval":45,"urgency":"due","latitude":-40.904835,"longitude":174.996211,"portatour_id":"c07d9a9036e94628b4a7de19f0eeecb9"},{"external_id":"","name":"Carters Wellingto Central","street":"174 Hutt Road","city":"Kaiwharawhara","zip":"6035","country":"NZ","customer_group":"Carters","categories":"","phone":"","email":"","call_note":"","last_call":"2026-02-17","call_interval":360,"urgency":"not due","latitude":-41.25677605591755,"longitude":174.7947590422853,"portatour_id":"292df3277bb4417c9f6b98d9ac32bd36"},{"external_id":"","name":"Wellington Airport","street":"Stewart Duff Drive","city":"Rongotai","zip":"6022","country":"NZ","customer_group":"Other","categories":"","phone":"","email":"","call_note":"","last_call":"2026-03-30","call_interval":730,"urgency":"not due","latitude":-41.32917996366776,"longitude":174.8120569564941,"portatour_id":"993a7d726728476d8884f3137006e1c6"},{"external_id":"","name":"Bunnings Naenae","street":"235 Cambridge Terrace","city":"Naenae","zip":"5011","country":"New Zealand","customer_group":"Bunnings","categories":"","phone":"","email":"","call_note":"","last_call":"2026-04-16","call_interval":42,"urgency":"overdue","latitude":-41.1993,"longitude":174.944726,"portatour_id":"82ba75845d084fd0a6fa7d5a39b9c9e8"},{"external_id":"","name":"Bay Of Islands ITM Kaikohe","street":"2 Mangakahia Road","city":"Kaikohe","zip":"0405","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"","email":"","call_note":"","last_call":"2024-08-28","call_interval":42,"urgency":"overdue","latitude":-35.406517,"longitude":173.803549,"portatour_id":"da72f858a80749499ad446d75be5a989"},{"external_id":"2142 | 5143","name":"Mitre 10 Wainuiomata","street":"Te Ara Raukura","city":"Wainuiomata","zip":"5014","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"04 564 8760","email":"","call_note":"","last_call":"2026-04-16","call_interval":42,"urgency":"overdue","latitude":-41.260741,"longitude":174.945396,"portatour_id":"786ec0a8656f436d9ca18184dad34091"},{"external_id":"552","name":"North Taranaki ITM Inglewood","street":"11 James Street","city":"Inglewood","zip":"4330","country":"New Zealand","customer_group":"ITM","categories":"","phone":"0800 248 668","email":"","call_note":"Try for shed signage","last_call":"2026-07-23","call_interval":120,"urgency":"not due","latitude":-39.153296,"longitude":174.210073,"portatour_id":"98bf6503605f42c7b50189fe11c8e60b"},{"external_id":"4349","name":"Hammer Hardware Turangi","street":"Town Centre","city":"TURANGI","zip":"3334","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"07 386 7761","email":"turangi@hammerhardware.co.nz","call_note":"","last_call":"2026-07-21","call_interval":180,"urgency":"not due","latitude":-38.989257,"longitude":175.808601,"portatour_id":"0dabcac823e945b9abbf43f52e2e982a"},{"external_id":"2416","name":"ITM Turangi","street":"65 Atirau Road","city":"TURANGI","zip":"3334","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"07 386 5736","email":"andrew@turangiitm.co.nz","call_note":"","last_call":"2026-07-21","call_interval":180,"urgency":"not due","latitude":-39.00165,"longitude":175.803594,"portatour_id":"e0152d2587104fc7859be69da7a91667"},{"external_id":"5147","name":"Dargaville Hammer Hardware","street":"30 Normanby Street","city":"Dargaville","zip":"0310","country":"New Zealand","customer_group":"Hammer Hardware","categories":"D","phone":"","email":"","call_note":"","last_call":"2026-02-10","call_interval":42,"urgency":"overdue","latitude":-35.942266,"longitude":173.867574,"portatour_id":"c121db1cc9ba41409a6fbebaef04bc66"},{"external_id":"","name":"Hammer Hardware Foxton","street":"73 Main Street","city":"Foxton","zip":"4814","country":"New Zealand","customer_group":"Hammer Hardware","categories":"C","phone":"","email":"","call_note":"","last_call":"2026-02-18","call_interval":90,"urgency":"overdue","latitude":-40.475523,"longitude":175.281587,"portatour_id":"8321d6d1ce3a4b9aa4a61da8a8fe7f55"},{"external_id":"","name":"Mitre 10 Central Wellington","street":"133 Tory Street","city":"Te Aro","zip":"6011","country":"New Zealand","customer_group":"Mitre 10","categories":"","phone":"","email":"brendan.hall@mitre10.co.nz","call_note":"Training with James and Team","last_call":"2026-03-26","call_interval":42,"urgency":"overdue","latitude":-41.296738,"longitude":174.779316,"portatour_id":"c52e1981d2a84e83a247ecee8956d765"},{"external_id":"","name":"Buildlink Head Office : Bream Bay","street":"Cnr Sime & Kepa Roads","city":"RUAKAKA","zip":"151","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"","call_interval":42,"urgency":"overdue","latitude":-35.87384,"longitude":174.463357,"portatour_id":"fd5820444f9b41ec8f40bc06f25c8064"},{"external_id":"","name":"Buildlink Head Office : Buildlink Kaitaia","street":"374 State Highway 1","city":"Kaitaia","zip":"","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"","call_interval":42,"urgency":"overdue","latitude":-35.073732,"longitude":173.257617,"portatour_id":"0c3db81f88b240089a260ce09c4db9fd"},{"external_id":"","name":"Buildlink Head Office : DJD Enterprises Ltd TA Concrete World","street":"","city":"Blenheim","zip":"","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"2025-05-28","call_interval":730,"urgency":"not due","latitude":-41.511738,"longitude":173.953003,"portatour_id":"15f9ed10d52e4a53a14ca3392ef3d5c6"},{"external_id":"","name":"Buildlink Head Office : Hautapu Rural Supplies","street":"","city":"Taihape","zip":"4720","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"2025-09-04","call_interval":42,"urgency":"overdue","latitude":-39.6779,"longitude":175.799,"portatour_id":"ed90cdabc79b4fbfb379e5d042e76607"},{"external_id":"","name":"Buildlink Head Office : Lumberland 2006 Limited","street":"","city":"Palmerston North","zip":"4410","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"Bring PA door Sample","last_call":"2026-02-04","call_interval":42,"urgency":"overdue","latitude":-40.356942,"longitude":175.609028,"portatour_id":"258a5d0db14d436590ee8832ee98b666"},{"external_id":"","name":"Buildlink Head Office : Sticks Building Supplies","street":"8 John Glenn Avenue, Rosedale, Auckland 0632","city":"Auckland","zip":"751","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"2026-02-25","call_interval":180,"urgency":"due","latitude":-36.747133,"longitude":174.695881,"portatour_id":"b7913f870f224614b5a48ffe14f415a1"},{"external_id":"","name":"Buildlink Head Office : Toots Timber & Hardware","street":"","city":"Whangarei","zip":"173","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"2026-02-11","call_interval":42,"urgency":"overdue","latitude":-35.683741,"longitude":174.334243,"portatour_id":"10b49be41d614566996528a085489ff1"},{"external_id":"","name":"Buildlink Head Office: East Taratahi Building Supplies Ltd","street":"William Wong Place","city":"Carterton","zip":"5713","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"2025-03-18","call_interval":180,"urgency":"overdue","latitude":-41.023501,"longitude":175.526406,"portatour_id":"057bdffc8925471b9859920960bc11ba"},{"external_id":"2504","name":"Mitre 10 Martin Westport","street":"47-55 Palmerston Street","city":"WESTPORT","zip":"7825","country":"New Zealand","customer_group":"Mitre 10","categories":"B","phone":"03 789 7879","email":"martin@mitre10.co.nz","call_note":"Greens parts, GX500 1MAT0SOH, Indent","last_call":"2026-07-30","call_interval":90,"urgency":"not due","latitude":-41.750017,"longitude":171.597465,"portatour_id":"6ceb450e97e345e7a478f191d0a91f64"},{"external_id":"2513","name":"ITM Greymouth Building Centre","street":"62-66 Tasman Street","city":"GREYMOUTH","zip":"7805","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 768 0441","email":"manager@itmgreymouth.co.nz","call_note":"Greens Parts, Follow up Doors","last_call":"2026-03-03","call_interval":90,"urgency":"overdue","latitude":-42.468525,"longitude":171.190193,"portatour_id":"a4fc141a5bd44d2a8101c700f413c204"},{"external_id":"2447","name":"Mitre 10 Griffen & Smith Hokitika","street":"33 Weld St","city":"HOKITIKA","zip":"7810","country":"New Zealand","customer_group":"Mitre 10","categories":"C","phone":"03 755 8254","email":"hokitika@mitre10.co.nz","call_note":"GX300 1MAT0SOH and/or Polys, Indent, Greens Parts","last_call":"2026-03-03","call_interval":90,"urgency":"overdue","latitude":-42.717847,"longitude":170.963118,"portatour_id":"3603868c48a44ccf8d4ec675fda78786"},{"external_id":"2442","name":"Mitre 10 Mega Greymouth","street":"41 Water Walk Road","city":"GREYMOUTH","zip":"7805","country":"New Zealand","customer_group":"Mitre 10 Mega","categories":"C","phone":"03 769 9036","email":"griffen.smith@mitre10.co.nz","call_note":"Displays, Kaipara Sticker, Loadshifters (300CFM), Indent","last_call":"2026-07-30","call_interval":90,"urgency":"not due","latitude":-42.459404,"longitude":171.195871,"portatour_id":"01e2cb6b11e74910b1191c4bd349cbb9"},{"external_id":"2386","name":"ITM McMullan Timber","street":"18 Kaniere Road","city":"HOKITIKA","zip":"7811","country":"New Zealand","customer_group":"ITM","categories":"D","phone":"03 755 8519","email":"timber@minidata.co.nz","call_note":"","last_call":"2026-07-30","call_interval":90,"urgency":"not due","latitude":-42.724776,"longitude":170.983883,"portatour_id":"e7040534936e4b81b138a15fb4206296"},{"external_id":"","name":"Buildlink Head Office: Reefton Hardware Buildlink","street":"37 Broadway","city":"Reefton","zip":"7830","country":"New Zealand","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"","last_call":"2025-05-27","call_interval":90,"urgency":"overdue","latitude":-42.119678,"longitude":171.866991,"portatour_id":"7add29797be34d289e6194c6ceee46fd"},{"external_id":"","name":"Carters Westport","street":"185 Derby Street","city":"Westport","zip":"7825","country":"New Zealand","customer_group":"Carters","categories":"","phone":"","email":"","call_note":"","last_call":"2026-07-30","call_interval":90,"urgency":"not due","latitude":-41.765388,"longitude":171.608433,"portatour_id":"e17d16ccd0554c11b31d1f1de296b7d5"},{"external_id":"4332","name":"Hammer Hardware Kawakawa","street":"","city":"KAWAKAWA","zip":"","country":"New Zealand","customer_group":"Hammer Hardware","categories":"","phone":"","email":"","call_note":"Establish Contact","last_call":"2026-02-11","call_interval":42,"urgency":"overdue","latitude":-35.3784,"longitude":174.071883,"portatour_id":"c45c1510f15c428ca9a31bba84d6f648"},{"external_id":"1076","name":"Buildlink Head Office: Eastown Timber & Fencing","street":"4 Holyoak Street","city":"WANGANUI","zip":"4500","country":"New Zealand","customer_group":"Buildlink","categories":"E","phone":"06 349 0040","email":"sales@eastown.co.nz","call_note":"","last_call":"2023-11-30","call_interval":120,"urgency":"overdue","latitude":-39.912497,"longitude":175.066622,"portatour_id":"8456f82ed34f46dfbe8a94b8e235bb7e"},{"external_id":"","name":"Kawakawa Farm & BuildLink","street":"16 State Highway 1","city":"Kawakawa","zip":"0210","country":"NZ","customer_group":"Buildlink","categories":"","phone":"","email":"","call_note":"Armorsteel?","last_call":"","call_interval":360,"urgency":"due","latitude":-35.37931437784353,"longitude":174.06497801480148,"portatour_id":"1a0a45df1c394c2892fbb16249330c4e"}]'
 
 CATEGORIES = [
     "Armorsteel",
@@ -66,8 +223,194 @@ PAGE = r"""
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>Sales Assistant Dashboard</title>
+    <title>Riverlea Group Sales Assistant</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    {% if view == 'trip_workspace' %}
+    <div class="workspace-shell">
+        <div class="panel">
+            <div class="workspace-head">
+                <div>
+                    <h2 style="margin-bottom:4px;">{{ workspace.trip.trip_name }}</h2>
+                    <p class="small" style="margin:0;">{{ workspace.trip.destination or 'Saved trip' }} · {{ workspace.trip.date_display }}</p>
+                    <div class="workspace-meta">
+                        <span class="change-badge change-neutral">{{ workspace.total_calls }} calls</span>
+                        <span class="change-badge change-neutral">{{ workspace.days|length }} days</span>
+                        <span class="change-badge {% if workspace.completed_calls == workspace.total_calls and workspace.total_calls %}change-positive{% else %}change-neutral{% endif %}">{{ workspace.completed_calls }} complete</span>
+                    </div>
+                </div>
+                <div class="toolbar">
+                    <a class="button-link secondary" href="{{ url_for('trip_prep', trip=workspace.trip.id) }}">Trip Setup</a>
+                    <a class="button-link" href="{{ url_for('on_the_road', trip_id=workspace.trip.id) }}">On the Road</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" style="padding-bottom:14px;">
+            <nav class="workspace-tabs" aria-label="Trip views">
+                <a href="{{ url_for('trip_workspace', trip_id=workspace.trip.id, tab='schedule') }}" class="{% if workspace_tab == 'schedule' %}active{% endif %}">Schedule</a>
+                <a href="{{ url_for('trip_workspace', trip_id=workspace.trip.id, tab='map') }}" class="{% if workspace_tab == 'map' %}active{% endif %}">Map</a>
+                <a href="{{ url_for('trip_workspace', trip_id=workspace.trip.id, tab='calendar') }}" class="{% if workspace_tab == 'calendar' %}active{% endif %}">Calendar</a>
+                <a href="{{ url_for('trip_workspace', trip_id=workspace.trip.id, tab='closeout') }}" class="{% if workspace_tab == 'closeout' %}active{% endif %}">Close Out</a>
+                <a href="{{ url_for('on_the_road', trip_id=workspace.trip.id) }}">On the Road</a>
+            </nav>
+        </div>
+
+        {% if workspace_tab in ['schedule','map'] and workspace.days %}
+        <div class="workspace-day-tabs" data-workspace-tabs>
+            {% for day in workspace.days %}<button type="button" data-day="{{ loop.index0 }}" class="{% if loop.first %}active{% endif %}">{{ day.tab_label }}</button>{% endfor %}
+        </div>
+        {% endif %}
+
+        {% if workspace_tab == 'schedule' %}
+        <div class="panel">
+            {% if workspace.days %}
+                {% for day in workspace.days %}
+                <section class="schedule-day {% if loop.first %}active{% endif %}" data-day-panel="{{ loop.index0 }}">
+                    <div class="schedule-heading"><strong>{{ day.full_label }}</strong><span>{{ day.calls|length }} calls · {{ day.total_visit_display }} customer time</span></div>
+                    {% if day.departure %}
+                    <div class="schedule-row"><div class="schedule-time">{{ day.departure }}</div><div class="schedule-main travel"><h4>Departure</h4><div class="small">Begin the day's route</div></div><div class="schedule-side">Start</div></div>
+                    {% endif %}
+                    {% for item in day.timeline %}
+                        {% if item.type == 'travel' %}
+                        <div class="schedule-row"><div class="schedule-time">{{ item.start }}</div><div class="schedule-main travel"><h4>{{ item.title }}</h4><div class="small">{{ item.detail }}</div></div><div class="schedule-side">{{ item.duration_display }}</div></div>
+                        {% elif item.type == 'break' %}
+                        <div class="schedule-row"><div class="schedule-time">{{ item.start }}</div><div class="schedule-main break"><h4>Work break</h4><div class="small">{{ item.detail }}</div></div><div class="schedule-side">{{ item.duration_display }}</div></div>
+                        {% else %}
+                        <div class="schedule-row"><div class="schedule-time">{{ item.start }}–{{ item.end }}</div><div class="schedule-main"><h4><a class="customer-link" href="{{ item.customer_url }}">{{ item.name }}</a></h4><div class="small">{{ item.address }} · {{ item.customer_group }}</div>{% if item.desired_outcome %}<div class="schedule-note"><strong>Desired outcome:</strong> {{ item.desired_outcome }}</div>{% endif %}{% if item.preparation_notes %}<div class="schedule-note"><strong>Prepare:</strong> {{ item.preparation_notes }}</div>{% endif %}{% if item.call_note %}<div class="schedule-note">⇒ {{ item.call_note }}</div>{% endif %}{% if item.open_actions %}<div class="schedule-note"><strong>{{ item.open_actions }} open action{% if item.open_actions != 1 %}s{% endif %}</strong></div>{% endif %}</div><div class="schedule-side">{{ item.duration }} min{% if item.locked %}<br><strong>Locked</strong>{% else %}<br>Flexible{% endif %}</div></div>
+                        {% endif %}
+                    {% endfor %}
+                </section>
+                {% endfor %}
+            {% else %}<div class="workspace-empty">No appointments are attached to this trip.</div>{% endif %}
+        </div>
+        {% elif workspace_tab == 'map' %}
+        <div class="panel">
+            {% if workspace.days %}<div id="workspace-map" class="workspace-map" aria-label="Trip route map"></div><p id="workspace-map-status" class="small" style="margin:10px 0 0;">Loading the road route…</p>{% else %}<div class="workspace-empty">No mapped appointments are attached to this trip.</div>{% endif %}
+        </div>
+        {% elif workspace_tab == 'calendar' %}
+        <div class="panel">
+            <div class="calendar-toolbar"><h2 style="margin:0;">{{ workspace.calendar.month_label }}</h2><span class="small">Travel, calls and breaks shown in time order</span></div>
+            <div class="trip-calendar">
+                {% for weekday in ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] %}<div class="calendar-weekday">{{ weekday }}</div>{% endfor %}
+                {% for cell in workspace.calendar.cells %}
+                <div class="calendar-cell {% if cell.outside %}outside{% endif %} {% if cell.is_trip_day %}trip-day{% endif %}">
+                    <div class="calendar-date">{{ cell.day }}</div>
+                    {% for event in cell.events %}<a class="calendar-event {{ event.type }}" href="{{ url_for('trip_workspace', trip_id=workspace.trip.id, tab='schedule') }}">{{ event.time }} {{ event.title }}</a>{% endfor %}
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% elif workspace_tab == 'closeout' %}
+        <div class="panel">
+            <div class="heading-row"><div><h2>Trip Close-Out</h2><p>Review outcomes, capture missed calls and finish the trip with a clean follow-up list.</p></div><a class="button-link secondary" href="{{ url_for('download_trip_closeout', trip_id=workspace.trip.id) }}">Download PDF Report</a></div>
+            {% if request.args.get('success') %}<div class="success">{{ request.args.get('success') }}</div>{% endif %}
+            {% if request.args.get('error') %}<div class="error">{{ request.args.get('error') }}</div>{% endif %}
+            <div class="closeout-grid">
+                <div class="closeout-card"><div class="label">Scheduled</div><div class="value">{{ workspace.closeout.total }}</div></div>
+                <div class="closeout-card good"><div class="label">Completed</div><div class="value">{{ workspace.closeout.completed }}</div></div>
+                <div class="closeout-card {% if workspace.closeout.skipped %}warn{% else %}good{% endif %}"><div class="label">Skipped</div><div class="value">{{ workspace.closeout.skipped }}</div></div>
+                <div class="closeout-card {% if workspace.closeout.open %}warn{% else %}good{% endif %}"><div class="label">Not Closed</div><div class="value">{{ workspace.closeout.open }}</div></div>
+            </div>
+            <div class="after-trip-progress">
+                <div class="after-trip-step {% if workspace.closeout.completed == workspace.closeout.total and workspace.closeout.total %}done{% else %}attention{% endif %}"><div class="number">1</div><h4>Visit outcomes</h4><p>{{ workspace.closeout.completed }} completed, {{ workspace.closeout.skipped }} skipped and {{ workspace.closeout.open }} still open.</p></div>
+                <div class="after-trip-step {% if workspace.closeout.notes_count >= workspace.closeout.completed and workspace.closeout.completed %}done{% else %}attention{% endif %}"><div class="number">2</div><h4>Notes captured</h4><p>{{ workspace.closeout.notes_count }} completed visits include notes.</p></div>
+                <div class="after-trip-step {% if workspace.closeout.pending_actions == 0 %}done{% endif %}"><div class="number">3</div><h4>Follow-ups</h4><p>{{ workspace.closeout.pending_actions }} open actions currently linked to these customers.</p></div>
+                <div class="after-trip-step {% if workspace.trip.completed_at %}done{% endif %}"><div class="number">4</div><h4>Close trip</h4><p>{% if workspace.trip.completed_at %}Closed {{ workspace.trip.completed_at_display }}{% else %}Complete the review and close the trip when ready.{% endif %}</p></div>
+            </div>
+        </div>
+        <div class="panel">
+            <div class="heading-row"><div><h2>Visit Review</h2><p>Every planned call remains visible, including completed, skipped and untouched visits.</p></div></div>
+            {% for visit in workspace.closeout.visits %}
+            <div class="visit-closeout-row">
+                <div><strong>{{ visit.date_display }}</strong><br><span class="small">{{ visit.visit_time }}{% if visit.actual_duration %} · {{ visit.actual_duration }} min actual{% endif %}</span></div>
+                <div><strong>{{ visit.store_name }}</strong><div class="small">{{ visit.status }}</div>{% if visit.outcome %}<div class="visit-closeout-note"><strong>Outcome:</strong> {{ visit.outcome }}</div>{% endif %}{% if visit.visit_notes %}<div class="visit-closeout-note">{{ visit.visit_notes }}</div>{% endif %}{% if visit.next_step %}<div class="visit-closeout-note"><strong>Next:</strong> {{ visit.next_step }}</div>{% endif %}</div>
+                <div><span class="change-badge {{ visit.badge_class }}">{{ visit.status }}</span></div>
+            </div>
+            {% endfor %}
+        </div>
+        <div class="panel">
+            <h2>Finish Trip</h2>
+            <form method="post" action="{{ url_for('trip_closeout_action', trip_id=workspace.trip.id) }}">
+                <label><strong>Close-out notes</strong><textarea class="review-textarea" name="closeout_notes" placeholder="Overall trip result, territory observations, key wins, issues and priorities for next trip...">{{ workspace.trip.closeout_notes or '' }}</textarea></label>
+                <label class="ready-row" style="margin-top:14px;"><input type="checkbox" name="create_reschedule_actions" value="1" checked>Create follow-up actions for skipped or untouched calls</label>
+                <div class="button-row" style="text-align:left;">
+                    {% if workspace.trip.completed_at %}<button type="submit" name="action" value="reopen" class="secondary">Reopen Trip</button>{% else %}<button type="submit" name="action" value="close">Close Trip</button>{% endif %}
+                    <button type="submit" name="action" value="save_notes" class="secondary">Save Notes Only</button>
+                </div>
+            </form>
+        </div>
+        {% endif %}
+    </div>
+
+    {% if workspace_tab == 'map' and workspace.days %}
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+    <script>
+    document.addEventListener('DOMContentLoaded', function(){
+        const days={{ workspace.map_days_json|safe }};
+        const tabs=[...document.querySelectorAll('[data-workspace-tabs] button')];
+        const status=document.getElementById('workspace-map-status');
+        const mapElement=document.getElementById('workspace-map');
+        if(!mapElement || typeof L === 'undefined'){
+            if(status) status.textContent='The map library could not load. Check the internet connection and refresh the page.';
+            return;
+        }
+        const map=L.map(mapElement).setView([-40.3,175.5],7);
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+        const layer=L.layerGroup().addTo(map);
+        const colours=['#246fe5','#7f56d9','#f79009','#12b76a','#d92d20'];
+        let routeController=null;
+        function straightLine(points,index,message){
+            L.polyline(points,{color:colours[index%colours.length],weight:4,dashArray:'8,6'}).addTo(layer);
+            status.textContent=message || 'Road routing is unavailable; showing the planned stop sequence.';
+        }
+        async function drawDay(index){
+            if(routeController) routeController.abort();
+            routeController=new AbortController();
+            layer.clearLayers();
+            const day=days[index];
+            if(!day||!day.stops.length){status.textContent='No mapped calls for this day.';return;}
+            const validStops=day.stops.filter(s=>Number.isFinite(Number(s.latitude))&&Number.isFinite(Number(s.longitude)));
+            const points=validStops.map(s=>[Number(s.latitude),Number(s.longitude)]);
+            if(!points.length){status.textContent='No valid customer coordinates are available for this day.';return;}
+            validStops.forEach((s,i)=>{const icon=L.divIcon({className:'',html:`<div class="map-stop-label">${i+1} · ${s.arrival}</div>`,iconAnchor:[20,14]});L.marker([Number(s.latitude),Number(s.longitude)],{icon}).addTo(layer).bindPopup(`<strong><a href="${s.customer_url}">${s.name}</a></strong><br>${s.address}<br>${s.arrival}–${s.departure}${s.desired_outcome?`<br><strong>Desired outcome:</strong> ${s.desired_outcome}`:''}`);});
+            if(points.length===1){map.setView(points[0],12);status.textContent=`${day.full_label}: one mapped call`;return;}
+            map.fitBounds(L.latLngBounds(points).pad(.15));
+            setTimeout(()=>map.invalidateSize(),50);
+            status.textContent='Calculating road route…';
+            const timeout=setTimeout(()=>routeController.abort(),8000);
+            try{
+                const coords=validStops.map(s=>`${Number(s.longitude)},${Number(s.latitude)}`).join(';');
+                const res=await fetch(`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`,{signal:routeController.signal});
+                if(!res.ok)throw new Error('routing unavailable');
+                const data=await res.json();
+                if(data.routes&&data.routes[0]){
+                    L.geoJSON(data.routes[0].geometry,{style:{color:colours[index%colours.length],weight:5,opacity:.85}}).addTo(layer);
+                    status.textContent=`${day.full_label}: ${(data.routes[0].distance/1000).toFixed(0)} km · ${Math.round(data.routes[0].duration/60)} min driving`;
+                } else throw new Error('no route');
+            }catch(e){
+                straightLine(points,index,e.name==='AbortError'?'Road routing timed out; showing the planned stop sequence.':'Road routing is unavailable; showing the planned stop sequence.');
+            }finally{
+                clearTimeout(timeout);
+            }
+        }
+        tabs.forEach((b,i)=>b.addEventListener('click',()=>{tabs.forEach(x=>x.classList.remove('active'));b.classList.add('active');drawDay(i);}));
+        drawDay(0);
+        setTimeout(()=>map.invalidateSize(),150);
+        window.addEventListener('resize',()=>map.invalidateSize());
+    });
+    </script>
+    {% endif %}
+    {% if workspace_tab == 'schedule' %}
+    <script>document.addEventListener('DOMContentLoaded',()=>{const tabs=[...document.querySelectorAll('[data-workspace-tabs] button')],panels=[...document.querySelectorAll('[data-day-panel]')];tabs.forEach((b,i)=>b.addEventListener('click',()=>{tabs.forEach(x=>x.classList.remove('active'));panels.forEach(x=>x.classList.remove('active'));b.classList.add('active');panels[i]?.classList.add('active');}));});</script>
+    {% endif %}
+    {% endif %}
+
+    {% if view == 'route_planner' %}
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+    {% endif %}
     <style>
         * { box-sizing: border-box; }
         body {
@@ -449,6 +792,113 @@ PAGE = r"""
         .number-positive { color: #087443; font-weight: 700; }
         .number-negative { color: #b42318; font-weight: 700; }
         .muted { color: #667085; }
+
+        .route-layout { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(320px,.75fr); gap:18px; align-items:start; }
+        #route-map { height:680px; width:100%; position:relative; overflow:hidden; border-radius:12px; border:1px solid #d0d5dd; background:#eef2f6; isolation:isolate; }
+
+        /* Leaflet fallback layout. These rules keep map tiles and controls contained
+           if the external Leaflet stylesheet is delayed or blocked. */
+        .leaflet-container { overflow:hidden; -webkit-tap-highlight-color:transparent; }
+        .leaflet-pane, .leaflet-tile, .leaflet-marker-icon, .leaflet-marker-shadow,
+        .leaflet-tile-container, .leaflet-pane > svg, .leaflet-pane > canvas,
+        .leaflet-zoom-box { position:absolute; left:0; top:0; }
+        .leaflet-map-pane, .leaflet-tile-pane, .leaflet-overlay-pane,
+        .leaflet-shadow-pane, .leaflet-marker-pane, .leaflet-tooltip-pane,
+        .leaflet-popup-pane { position:absolute; left:0; top:0; }
+        .leaflet-tile { width:256px !important; height:256px !important; max-width:none !important; max-height:none !important; padding:0 !important; margin:0 !important; user-select:none; -webkit-user-drag:none; }
+        .leaflet-container img.leaflet-image-layer, .leaflet-container .leaflet-tile { max-width:none !important; max-height:none !important; }
+        .leaflet-control-container { position:absolute; inset:0; pointer-events:none; z-index:800; }
+        .leaflet-control { position:relative; z-index:800; pointer-events:auto; float:left; clear:both; }
+        .leaflet-top, .leaflet-bottom { position:absolute; z-index:1000; pointer-events:none; }
+        .leaflet-top { top:0; } .leaflet-right { right:0; } .leaflet-bottom { bottom:0; } .leaflet-left { left:0; }
+        .leaflet-top .leaflet-control { margin-top:10px; } .leaflet-bottom .leaflet-control { margin-bottom:10px; }
+        .leaflet-left .leaflet-control { margin-left:10px; } .leaflet-right .leaflet-control { margin-right:10px; float:right; }
+        .leaflet-zoom-animated { transform-origin:0 0; }
+        .leaflet-marker-icon, .leaflet-marker-shadow { display:block; }
+        .route-toolbar { display:grid; grid-template-columns:2fr 1fr 1fr auto; gap:10px; margin-bottom:14px; }
+        .route-toolbar input, .route-toolbar select { width:100%; padding:10px; border:1px solid #d0d5dd; border-radius:8px; background:white; font:inherit; }
+        .route-side { position:sticky; top:14px; }
+        .route-summary { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:14px; }
+        .route-mini { padding:12px; background:#f8fafc; border:1px solid #e4e7ec; border-radius:9px; }
+        .route-mini strong { display:block; font-size:22px; margin-top:3px; }
+        .selected-list { max-height:430px; overflow:auto; border:1px solid #e4e7ec; border-radius:10px; }
+        .selected-customer { padding:11px 12px; border-bottom:1px solid #e4e7ec; display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+        .selected-customer:last-child { border-bottom:0; }
+        .selected-customer button { padding:5px 9px; font-size:12px; background:#b42318; }
+        .route-actions { display:flex; gap:9px; flex-wrap:wrap; margin-top:12px; }
+        .route-actions button { padding:10px 14px; font-size:14px; }
+        .route-import { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+        .route-import input[type=file] { max-width:420px; }
+        .map-legend { display:flex; flex-wrap:wrap; gap:12px; margin-top:10px; color:#667085; font-size:13px; }
+        .map-legend span { display:inline-flex; align-items:center; gap:6px; }
+        .legend-pin { width:12px; height:12px; border-radius:50%; display:inline-block; border:2px solid white; box-shadow:0 0 0 1px #667085; }
+        .pin-overdue { background:#d92d20; }.pin-due { background:#f79009; }.pin-not-due { background:#12b76a; }.pin-other { background:#667085; }.pin-selected { background:#246fe5; }
+        .route-save-grid { display:grid; grid-template-columns:1fr 130px 130px; gap:10px; margin-top:14px; }
+        .route-save-grid input { width:100%; padding:10px; border:1px solid #d0d5dd; border-radius:8px; }
+        .saved-route-row { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid #e4e7ec; }
+        .saved-route-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+        .saved-route-actions form { margin:0; }
+        .compact-danger { padding:9px 12px; font-size:13px; background:#b42318; }
+        .compact-danger:hover { background:#912018; }
+        .route-planning-panel { margin-top:18px; padding:16px; border:1px solid #d0d5dd; border-radius:12px; background:#f8fafc; }
+        .route-planning-panel h3 { margin:0 0 12px; }
+        .route-plan-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+        .route-plan-grid label { display:block; font-size:12px; font-weight:700; color:#475467; }
+        .route-plan-grid input, .route-plan-grid select { width:100%; margin-top:5px; padding:9px; border:1px solid #d0d5dd; border-radius:8px; background:white; font:inherit; }
+        .route-location-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:end; }
+        .route-location-row button { padding:9px 11px; font-size:12px; }
+        .route-check { display:flex !important; align-items:center; gap:8px; min-height:42px; padding-top:19px; }
+        .route-check input { width:18px !important; height:18px; margin:0 !important; }
+        .route-status { margin-top:12px; padding:11px 12px; border-radius:9px; background:#eef4ff; color:#194185; font-size:13px; }
+        .route-status.error-state { background:#fee4e2; color:#b42318; }
+        .route-result { margin-top:18px; }
+        .route-result-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:14px; }
+        .route-result-summary .route-mini { background:white; }
+        .route-day { margin-top:12px; border:1px solid #d0d5dd; border-radius:11px; overflow:hidden; background:white; }
+        .route-day-header { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:13px 14px; background:#101828; color:white; }
+        .route-day-header strong { font-size:17px; }
+        .route-day-header a { color:white; font-size:12px; font-weight:700; }
+        .route-stop { display:grid; grid-template-columns:40px 1fr auto; gap:10px; align-items:center; padding:11px 12px; border-top:1px solid #e4e7ec; }
+        .route-stop:first-child { border-top:0; }
+        .route-stop-number { width:30px; height:30px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#eef4ff; color:#175cd3; font-weight:800; }
+        .route-stop-time { text-align:right; color:#667085; font-size:12px; white-space:nowrap; }
+        .route-reorder { display:flex; gap:5px; margin-top:5px; }
+        .route-reorder button { padding:4px 7px; font-size:11px; background:#475467; }
+        .map-mode-banner { display:none; margin:0 0 10px; padding:10px 12px; border-radius:8px; background:#fef0c7; color:#92400e; font-weight:700; }
+        .map-mode-banner.active { display:block; }
+        .leaflet-interactive.route-line { stroke-linecap:round; stroke-linejoin:round; }
+        @media(max-width:1050px){ .route-layout{grid-template-columns:1fr;} .route-side{position:static;} #route-map{height:580px;} }
+        @media(max-width:900px){ .route-plan-grid{grid-template-columns:1fr 1fr;} .route-result-summary{grid-template-columns:1fr 1fr;} }
+        @media(max-width:700px){ .route-toolbar,.route-save-grid,.route-plan-grid{grid-template-columns:1fr;} #route-map{height:500px;} .route-summary,.route-result-summary{grid-template-columns:1fr 1fr;} .route-stop{grid-template-columns:36px 1fr;} .route-stop-time{grid-column:2;text-align:left;} }
+
+        .road-dashboard { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:16px 0 20px; }
+        .road-kpi { padding:15px; border:1px solid #e4e7ec; border-radius:11px; background:#f8fafc; }
+        .road-kpi .label { color:#667085; font-size:12px; margin-bottom:5px; }
+        .road-kpi .value { font-size:23px; font-weight:800; }
+        .road-card.active { border-color:#246fe5; box-shadow:0 0 0 2px #dbeafe; }
+        .road-card.skipped { border-color:#fdba74; background:#fff7ed; }
+        .road-status-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:8px 0 3px; }
+        .road-status-chip { display:inline-block; padding:6px 9px; border-radius:999px; font-size:12px; font-weight:800; background:#f2f4f7; color:#475467; }
+        .road-status-chip.active { background:#eef4ff; color:#175cd3; }
+        .road-status-chip.complete { background:#dcfae6; color:#087443; }
+        .road-status-chip.skipped { background:#fef0c7; color:#b54708; }
+        .road-live-actions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:9px; margin:14px 0; }
+        .road-live-actions form { margin:0; }
+        .road-live-actions button, .road-live-actions a { width:100%; text-align:center; padding:11px 9px; font-size:14px; }
+        .road-fields { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+        .road-fields label { display:block; font-size:13px; font-weight:700; color:#475467; }
+        .road-fields input, .road-fields select { width:100%; margin-top:5px; padding:10px; border:1px solid #d0d5dd; border-radius:8px; background:white; }
+        .road-attachment { display:flex; justify-content:space-between; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid #e4e7ec; }
+        .road-attachment:last-child { border-bottom:0; }
+        @media(max-width:800px){ .road-dashboard{grid-template-columns:1fr 1fr;} .road-live-actions{grid-template-columns:1fr 1fr;} }
+        @media(max-width:520px){ .road-dashboard,.road-fields{grid-template-columns:1fr;} .road-card{padding:16px;} .road-store{font-size:24px;} .road-live-actions{grid-template-columns:1fr 1fr;} .road-live-actions button,.road-live-actions a{font-size:15px;padding:13px 8px;} }
+
+
+        .daily-hours-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+        .daily-hours-card { display:grid; grid-template-columns:64px 1fr 1fr; gap:10px; align-items:end; padding:12px; border:1px solid #d0d5dd; border-radius:10px; background:#fff; }
+        .daily-hours-card strong { align-self:center; white-space:nowrap; }
+        .daily-hours-card label { min-width:0; }
+        .daily-hours-card input { width:100%; min-width:0; }
         @media print {
             .nav, .upload-panel, .toolbar, button { display: none !important; }
             body { background: white; }
@@ -779,29 +1229,780 @@ PAGE = r"""
         .step-anchor { scroll-margin-top:20px; }
         @media (max-width:900px) { .plan-grid,.plan-form-grid { grid-template-columns:1fr; } }
 
+        .route-workflow-form { margin-top:18px; padding:18px; border:1px solid #b2ccff; border-radius:12px; background:#f5f8ff; }
+        .route-workflow-grid { display:grid; grid-template-columns:1.4fr 1fr 1fr auto; gap:12px; align-items:end; }
+        .route-workflow-grid label { display:block; font-size:13px; font-weight:700; color:#475467; }
+        .route-workflow-grid input { width:100%; margin-top:6px; padding:10px; border:1px solid #d0d5dd; border-radius:8px; font:inherit; background:white; }
+        .route-context { margin-top:5px; display:flex; gap:6px; flex-wrap:wrap; }
+        .route-context span { padding:3px 7px; border-radius:999px; background:#eef4ff; color:#175cd3; font-size:11px; font-weight:700; }
+        @media(max-width:850px){.route-workflow-grid{grid-template-columns:1fr 1fr}.route-workflow-grid button{grid-column:1/-1}}
+        @media(max-width:520px){.route-workflow-grid{grid-template-columns:1fr}}
+
+        .settings-section-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; }
+        .settings-category { border:1px solid #d0d5dd; border-radius:10px; overflow:hidden; background:white; }
+        .settings-category h3 { margin:0; padding:11px 14px; background:#e7aa0b; color:white; font-size:14px; text-transform:uppercase; letter-spacing:.03em; }
+        .settings-category a { display:block; padding:11px 14px; border-top:1px solid #e4e7ec; color:#175cd3; text-decoration:none; font-size:14px; }
+        .settings-category a:hover { background:#f8fafc; }
+        .customer-settings-toolbar { display:grid; grid-template-columns:1.5fr repeat(3,minmax(145px,.7fr)) auto; gap:10px; align-items:end; }
+        .customer-settings-toolbar label, .bulk-edit-grid label { display:block; font-size:12px; font-weight:700; color:#475467; }
+        .customer-settings-toolbar input, .customer-settings-toolbar select, .bulk-edit-grid input, .bulk-edit-grid select { width:100%; margin-top:5px; padding:9px; border:1px solid #d0d5dd; border-radius:8px; background:white; }
+        .bulk-edit-grid { display:grid; grid-template-columns:repeat(5,minmax(135px,1fr)) auto; gap:10px; align-items:end; }
+        .customer-settings-table { width:100%; border-collapse:separate; border-spacing:0; min-width:1900px; }
+        .customer-settings-table th { position:sticky; top:0; z-index:3; padding:10px 8px; background:#101828; color:white; font-size:12px; text-align:left; white-space:nowrap; }
+        .customer-settings-table td { padding:7px 6px; border-bottom:1px solid #e4e7ec; vertical-align:top; background:white; }
+        .customer-settings-table tr:nth-child(even) td { background:#f8fafc; }
+        .customer-settings-table input, .customer-settings-table select, .customer-settings-table textarea { width:100%; min-width:90px; padding:8px; border:1px solid #d0d5dd; border-radius:7px; background:white; font:inherit; font-size:13px; }
+        .customer-settings-table textarea { min-width:230px; min-height:38px; resize:vertical; }
+        .customer-settings-table .name-field { min-width:230px; font-weight:700; }
+        .customer-settings-table .address-field { min-width:210px; }
+        .customer-settings-table .city-field { min-width:125px; }
+        .customer-settings-table .number-field { min-width:76px; }
+        .customer-settings-table .checkbox-cell { text-align:center; width:42px; }
+        .customer-settings-table .checkbox-cell input { width:18px; min-width:18px; height:18px; }
+        .settings-table-wrap { max-height:680px; overflow:auto; border:1px solid #d0d5dd; border-radius:10px; }
+        .unsaved-note { color:#b54708; font-size:12px; font-weight:700; display:none; }
+        @media(max-width:1000px){.settings-section-grid{grid-template-columns:1fr 1fr}.customer-settings-toolbar{grid-template-columns:1fr 1fr}.bulk-edit-grid{grid-template-columns:1fr 1fr}.customer-settings-toolbar button,.bulk-edit-grid button{grid-column:1/-1}}
+        @media(max-width:600px){.settings-section-grid,.customer-settings-toolbar,.bulk-edit-grid{grid-template-columns:1fr}}
+
         @media print {
             .nav, .button-row, .subtitle, .no-print { display:none !important; }
             .page { max-width:none; padding:0; }
             .panel { box-shadow:none; border:1px solid #ddd; break-inside:avoid; }
             .print-only { display:block; }
         }
+
+
+        /* Stage 6: unified trip workspace */
+        .workspace-shell { display:grid; gap:16px; }
+        .workspace-head { display:flex; justify-content:space-between; gap:18px; align-items:flex-start; flex-wrap:wrap; }
+        .workspace-meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+        .workspace-tabs { display:flex; gap:7px; flex-wrap:wrap; border-bottom:1px solid #d0d5dd; padding-bottom:10px; }
+        .workspace-tabs a { padding:10px 15px; border-radius:8px 8px 0 0; text-decoration:none; color:#344054; font-weight:800; background:#f2f4f7; }
+        .workspace-tabs a.active { background:#246fe5; color:white; }
+        .workspace-day-tabs { display:flex; justify-content:center; gap:7px; flex-wrap:wrap; margin:2px 0 14px; }
+        .workspace-day-tabs button { padding:8px 13px; background:#f2f4f7; color:#344054; }
+        .workspace-day-tabs button.active { background:#eaaa08; color:#101828; }
+        .schedule-day { display:none; border:1px solid #d0d5dd; border-radius:10px; overflow:hidden; background:white; }
+        .schedule-day.active { display:block; }
+        .schedule-heading { padding:12px 16px; background:#101828; color:white; display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+        .schedule-row { display:grid; grid-template-columns:112px 1fr 115px; align-items:start; border-top:1px solid #d0d5dd; min-height:58px; }
+        .schedule-row:first-child { border-top:0; }
+        .schedule-time { padding:12px 13px; font-weight:800; color:#175cd3; }
+        .schedule-main { padding:11px 13px; border-left:5px solid #2e90fa; }
+        .schedule-main.travel { border-left-color:#98a2b3; background:#f2f4f7; }
+        .schedule-main.break { border-left-color:#eaaa08; background:#fffaeb; }
+        .schedule-main h4 { margin:0 0 3px; font-size:16px; }
+        .schedule-side { padding:11px 13px; text-align:right; color:#667085; font-size:13px; }
+        .schedule-note { margin-top:6px; color:#475467; font-size:13px; }
+        .workspace-map { height:680px; border:1px solid #d0d5dd; border-radius:10px; overflow:hidden; }
+        .workspace-map-day { display:none; }
+        .workspace-map-day.active { display:block; }
+        .map-stop-label { background:white; border:2px solid #d92d20; border-radius:5px; color:#101828; font-weight:800; padding:2px 5px; box-shadow:0 2px 7px rgba(0,0,0,.25); white-space:nowrap; }
+        .calendar-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
+        .trip-calendar { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); border-left:1px solid #d0d5dd; border-top:1px solid #d0d5dd; }
+        .calendar-weekday { padding:8px; text-align:center; background:#f2f4f7; font-weight:800; border-right:1px solid #d0d5dd; border-bottom:1px solid #d0d5dd; }
+        .calendar-cell { min-height:145px; padding:7px; border-right:1px solid #d0d5dd; border-bottom:1px solid #d0d5dd; background:white; }
+        .calendar-cell.outside { background:#f9fafb; color:#98a2b3; }
+        .calendar-cell.trip-day { background:#fffdf0; }
+        .calendar-date { font-weight:800; margin-bottom:5px; }
+        .calendar-event { display:block; margin:3px 0; padding:5px 6px; border-radius:4px; background:#3498bd; color:white; text-decoration:none; font-size:11px; line-height:1.3; overflow:hidden; }
+        .calendar-event.travel { background:#0b658a; }
+        .calendar-event.break { background:#eaaa08; color:#101828; }
+        .workspace-empty { padding:40px 20px; text-align:center; color:#667085; }
+        @media(max-width:800px){ .schedule-row{grid-template-columns:85px 1fr}.schedule-side{grid-column:2;text-align:left;padding-top:0}.workspace-map{height:520px}.trip-calendar{grid-template-columns:1fr}.calendar-weekday{display:none}.calendar-cell{min-height:auto}.calendar-cell.outside{display:none} }
+
+
+        /* Stage 7: simplified workflow shell */
+        body { background:#f5f7fa; color:#182230; }
+        .page { max-width:1580px; padding:20px 24px 64px; }
+        .app-shell-header { display:flex; justify-content:space-between; align-items:center; gap:20px; padding:6px 2px 18px; }
+        .brand-block { display:flex; align-items:center; gap:14px; }
+        .brand-mark { width:44px; height:44px; display:flex; align-items:center; justify-content:center; border-radius:12px; background:#175cd3; color:white; font-weight:800; letter-spacing:.03em; }
+        .app-shell-header h1 { margin:0; font-size:27px; line-height:1.1; }
+        .app-shell-header p { margin:5px 0 0; color:#667085; font-size:14px; }
+        .header-link { display:inline-block; padding:9px 13px; border-radius:8px; color:#344054; text-decoration:none; font-weight:700; border:1px solid #d0d5dd; background:white; }
+        .header-link.active { color:#175cd3; border-color:#84adff; background:#eff4ff; }
+        .workflow-shell { overflow:hidden; margin-bottom:16px; border:1px solid #dfe4ea; border-radius:14px; background:white; box-shadow:0 2px 8px rgba(16,24,40,.04); }
+        .workflow-label { padding:9px 14px 7px; color:#667085; font-size:11px; font-weight:800; letter-spacing:.12em; }
+        .workflow-primary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); border-top:1px solid #eef1f4; }
+        .workflow-item { min-width:0; display:flex; align-items:center; gap:10px; padding:14px 15px; color:#344054; text-decoration:none; border-right:1px solid #eef1f4; }
+        .workflow-item:last-child { border-right:0; }
+        .workflow-item > span { flex:0 0 30px; width:30px; height:30px; display:flex; align-items:center; justify-content:center; border-radius:50%; background:#f2f4f7; color:#475467; font-weight:800; }
+        .workflow-item div { min-width:0; }
+        .workflow-item strong,.workflow-item small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .workflow-item strong { font-size:14px; }
+        .workflow-item small { margin-top:2px; color:#667085; font-size:11px; }
+        .workflow-item.active { background:#eff4ff; color:#175cd3; box-shadow:inset 0 -3px 0 #175cd3; }
+        .workflow-item.active > span { background:#175cd3; color:white; }
+        .workflow-item.active small { color:#475467; }
+        .workspace-nav { display:flex; align-items:center; flex-wrap:wrap; gap:5px; padding:9px 12px; border-top:1px solid #e4e7ec; background:#fafbfc; }
+        .workspace-label { margin-right:4px; color:#98a2b3; font-size:10px; font-weight:800; letter-spacing:.12em; }
+        .workspace-nav a { padding:7px 10px; border-radius:7px; color:#475467; text-decoration:none; font-size:13px; font-weight:700; }
+        .workspace-nav a:hover,.workspace-nav a.active { color:#175cd3; background:#eaf2ff; }
+        .workspace-nav b { display:inline-flex; min-width:20px; height:20px; align-items:center; justify-content:center; padding:0 5px; border-radius:999px; background:#d92d20; color:white; font-size:11px; }
+        .page-context { display:flex; justify-content:space-between; align-items:center; gap:20px; margin-bottom:18px; padding:18px 20px; border:1px solid #dfe4ea; border-radius:14px; background:#101828; color:white; }
+        .page-context h2 { margin:3px 0 4px; font-size:25px; }
+        .page-context p { margin:0; color:#d0d5dd; font-size:14px; }
+        .eyebrow { color:#84adff; font-size:11px; font-weight:800; letter-spacing:.1em; }
+        .context-next { flex:0 0 auto; }
+        .context-next .button-link { white-space:nowrap; }
+        .panel { margin-bottom:16px; padding:20px; border:1px solid #dfe4ea; border-radius:12px; box-shadow:0 2px 7px rgba(16,24,40,.035); }
+        .panel > .heading-row:first-child { margin-bottom:4px; }
+        .heading-row h2 { font-size:23px; }
+        .plan-card,.chart-card,.mini-card,.metric,.file-detail,.settings-category,.road-card,.briefing-card,.customer-action-card { box-shadow:none; }
+        .button-row { margin-top:16px; }
+        button,.button-link,.view-link { transition:background .15s ease, transform .05s ease; }
+        button:active,.button-link:active,.view-link:active { transform:translateY(1px); }
+        .trip-steps { position:sticky; top:8px; z-index:20; padding:8px; border:1px solid #dfe4ea; border-radius:12px; background:rgba(255,255,255,.96); box-shadow:0 3px 12px rgba(16,24,40,.08); }
+        .trip-step { text-decoration:none; text-align:center; }
+        .workspace-tabs { position:sticky; top:8px; z-index:20; background:white; padding-top:4px; }
+        @media(max-width:1050px){ .workflow-primary{grid-template-columns:repeat(5,minmax(120px,1fr));overflow-x:auto}.workflow-item{min-width:145px}.page-context{align-items:flex-start}.context-next{margin-top:4px} }
+        @media(max-width:700px){ .page{padding:14px 12px 50px}.app-shell-header{align-items:flex-start}.app-shell-header p{display:none}.workflow-primary{display:flex;overflow-x:auto}.workflow-item{min-width:150px}.workspace-nav{overflow-x:auto;flex-wrap:nowrap}.workspace-nav a{white-space:nowrap}.page-context{display:block}.context-next{margin-top:14px}.context-next .button-link{width:100%;text-align:center}.panel{padding:16px} }
+
+
+        /* Riverlea Group brand layer — public Riverlea logo and website-inspired palette */
+        :root {
+            --riverlea-blue:#43A9DF;
+            --riverlea-blue-dark:#147DAF;
+            --riverlea-charcoal:#28333D;
+            --riverlea-ink:#15212B;
+            --riverlea-silver:#D9DEE3;
+            --riverlea-mist:#F3F5F6;
+            --riverlea-white:#FFFFFF;
+        }
+        body { background:var(--riverlea-mist); color:var(--riverlea-ink); }
+        .page { max-width:1580px; }
+        .app-shell-header {
+            margin-bottom:14px; padding:16px 20px; border-radius:14px;
+            background:var(--riverlea-charcoal); color:white;
+            box-shadow:0 5px 18px rgba(21,33,43,.14);
+        }
+        .brand-block { gap:22px; min-width:0; }
+        .riverlea-logo { display:flex; align-items:center; gap:10px; flex:0 0 auto; }
+        .riverlea-symbol { width:48px; height:48px; display:block; }
+        .riverlea-wordmark { position:relative; display:flex; align-items:flex-end; min-width:184px; line-height:1; }
+        .riverlea-name { color:white; font-size:35px; font-weight:700; letter-spacing:-1.5px; }
+        .riverlea-group { margin:0 0 1px 5px; color:var(--riverlea-blue); font-size:13px; font-weight:500; }
+        .product-title { padding-left:20px; border-left:1px solid rgba(255,255,255,.22); min-width:0; }
+        .app-shell-header .product-title h1 { color:white; font-size:24px; }
+        .app-shell-header .product-title p { color:#D9E0E5; }
+        .header-link { color:white; border-color:rgba(255,255,255,.28); background:rgba(255,255,255,.08); }
+        .header-link:hover,.header-link.active { color:var(--riverlea-ink); border-color:var(--riverlea-blue); background:var(--riverlea-blue); }
+        .workflow-shell { border-color:#D4DADE; }
+        .workflow-label,.workspace-label { color:#6E7B85; }
+        .workflow-item.active { background:#EAF7FD; color:var(--riverlea-blue-dark); box-shadow:inset 0 -3px 0 var(--riverlea-blue); }
+        .workflow-item.active > span { background:var(--riverlea-blue); color:white; }
+        .workflow-item:hover { background:#F5FBFE; }
+        .workspace-nav a:hover,.workspace-nav a.active { color:var(--riverlea-blue-dark); background:#EAF7FD; }
+        .page-context { border-color:var(--riverlea-charcoal); background:var(--riverlea-charcoal); }
+        .eyebrow { color:#73C4EA; }
+        button,.button-link,.view-link { background:var(--riverlea-blue-dark); }
+        button:hover,.button-link:hover,.view-link:hover { background:#0E6791; }
+        button.secondary,.button-link.secondary,.secondary-button { background:#52616D; color:white; }
+        button.secondary:hover,.button-link.secondary:hover,.secondary-button:hover { background:var(--riverlea-charcoal); }
+        .nav a.active,.progress-fill,.trip-step.current { background:var(--riverlea-blue-dark); }
+        .month-link,.customer-link { color:var(--riverlea-blue-dark); }
+        .panel { border-color:#D8DEE2; }
+        .summary-card { background:var(--riverlea-charcoal); }
+        .control-card { background:var(--riverlea-charcoal); }
+        .road-day-heading,.store-review-heading { background:#EAF7FD; color:#155D7E; }
+        .mini-tag,.report-tag,.column-pill { background:#EAF7FD; color:#155D7E; }
+        .schedule-time { color:var(--riverlea-blue-dark); }
+        .schedule-main { border-left-color:var(--riverlea-blue); }
+        .calendar-event { background:var(--riverlea-blue-dark); }
+        .calendar-event.travel { background:var(--riverlea-charcoal); }
+        .workspace-tabs a.active { color:var(--riverlea-blue-dark); border-color:var(--riverlea-blue); }
+        input:focus,select:focus,textarea:focus { outline:2px solid rgba(67,169,223,.35); border-color:var(--riverlea-blue); }
+        @media(max-width:760px){
+            .app-shell-header{padding:14px;align-items:flex-start}.brand-block{gap:12px}.riverlea-symbol{width:40px;height:40px}
+            .riverlea-name{font-size:29px}.riverlea-wordmark{min-width:154px}.product-title{display:none}
+        }
+
     </style>
 </head>
 <body>
 <div class="page">
-    <h1>Sales Assistant Dashboard <span style="font-size:14px;color:#667085;vertical-align:middle;">M10 Fix v4</span></h1>
-    <p class="subtitle">Save monthly NetSuite results, compare performance, and build year-to-date history.</p>
+    <header class="app-shell-header">
+        <div class="brand-block">
+            <div class="riverlea-logo" aria-label="Riverlea Group">
+                <svg class="riverlea-symbol" viewBox="0 0 64 64" role="img" aria-hidden="true">
+                    <circle cx="32" cy="32" r="29" fill="#ffffff"/>
+                    <path d="M5 27C9 12 21 4 35 4c10 0 18 4 24 11-10-2-19 0-27 5-8 5-16 8-27 7Z" fill="#43A9DF"/>
+                    <path d="M59 37C54 51 44 60 29 60 18 60 9 55 4 46c10 2 19 0 27-5 8-5 17-7 28-4Z" fill="#D9DEE3"/>
+                    <path d="M4 45c11 2 20 0 28-5 8-5 17-7 27-4-5 7-12 12-20 15-13 5-25 3-35-6Z" fill="#28333D"/>
+                </svg>
+                <div class="riverlea-wordmark">
+                    <span class="riverlea-name">Riverlea</span>
+                    <span class="riverlea-group">Group</span>
+                </div>
+            </div>
+            <div class="product-title">
+                <h1>Sales Assistant</h1>
+                <p>Plan the week, build efficient trips, complete calls, and close out every follow-up.</p>
+            </div>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('settings') }}" class="header-link {% if view == 'settings' %}active{% endif %}">Settings</a>
+        </div>
+    </header>
 
-    <div class="workflow-nav">
-        <a href="{{ url_for('control_centre') }}" class="{% if view == 'control_centre' %}active{% endif %}"><span>1</span><strong>Home</strong><small>This week</small></a>
-        <a href="{{ url_for('trip_prep') }}" class="{% if view == 'trip_prep' %}active{% endif %}"><span>2</span><strong>Plan Trip</strong><small>Schedule &amp; materials</small></a>
-        <a href="{{ url_for('on_the_road') }}" class="{% if view == 'on_the_road' %}active{% endif %}"><span>3</span><strong>On the Road</strong><small>Today’s calls</small></a>
-        <a href="{{ url_for('follow_up') }}" class="{% if view == 'follow_up' %}active{% endif %}"><span>4</span><strong>After Trip</strong><small>Notes &amp; follow-ups</small></a>
-        <a href="{{ url_for('customer_priorities') }}" class="{% if view in ['customer_priorities', 'customer_detail'] %}active{% endif %}"><span>5</span><strong>Customers</strong><small>Priorities &amp; actions</small></a>
-        <a href="{{ url_for('home') }}" class="{% if view in ['dashboard', 'history', 'saved_month', 'opportunities', 'opportunity_library', 'saved_opportunity', 'visit_brief', 'actions', 'action_form', 'qtr_bonus'] %}active{% endif %}"><span>6</span><strong>Sales Performance</strong><small>Monthly reports &amp; trends</small></a>
-        <a href="{{ url_for('travel_expenses') }}" class="{% if view == 'travel_expenses' %}active{% endif %}"><span>7</span><strong>Travel &amp; Expenses</strong><small>Bookings &amp; costs</small></a>
+    <section class="workflow-shell" aria-label="Main sales workflow">
+        <div class="workflow-label">WORKFLOW</div>
+        <nav class="workflow-primary">
+            <a href="{{ url_for('control_centre') }}" class="workflow-item {% if view == 'control_centre' %}active{% endif %}"><span>1</span><div><strong>Prepare</strong><small>Weekly priorities</small></div></a>
+            <a href="{{ url_for('route_planner') }}" class="workflow-item {% if view == 'route_planner' %}active{% endif %}"><span>2</span><div><strong>Build Route</strong><small>Select &amp; optimise</small></div></a>
+            <a href="{{ url_for('trip_prep') }}" class="workflow-item {% if view in ['trip_prep','trip_workspace'] %}active{% endif %}"><span>3</span><div><strong>Finalise Trip</strong><small>Schedule &amp; materials</small></div></a>
+            <a href="{{ url_for('on_the_road') }}" class="workflow-item {% if view == 'on_the_road' %}active{% endif %}"><span>4</span><div><strong>On the Road</strong><small>Run today’s calls</small></div></a>
+            <a href="{{ url_for('follow_up') }}" class="workflow-item {% if view == 'follow_up' %}active{% endif %}"><span>5</span><div><strong>Close Out</strong><small>Notes &amp; follow-ups</small></div></a>
+        </nav>
+        <nav class="workspace-nav" aria-label="Sales tools">
+            <span class="workspace-label">TOOLS</span>
+            <a href="{{ url_for('customer_priorities') }}" class="{% if view in ['customer_priorities','customer_detail'] %}active{% endif %}">Customers</a>
+            <a href="{{ url_for('home') }}" class="{% if view in ['dashboard','history','saved_month','opportunities','opportunity_library','saved_opportunity','visit_brief','qtr_bonus'] %}active{% endif %}">Performance</a>
+            <a href="{{ url_for('actions') }}" class="{% if view in ['actions','action_form'] %}active{% endif %}">Actions{% if open_action_count %} <b>{{ open_action_count }}</b>{% endif %}</a>
+            <a href="{{ url_for('travel_expenses') }}" class="{% if view == 'travel_expenses' %}active{% endif %}">Travel &amp; Expenses</a>
+            <a href="{{ url_for('settings') }}" class="{% if view == 'settings' %}active{% endif %}">Settings</a>
+        </nav>
+    </section>
+
+    <section class="page-context">
+        <div>
+            {% if view == 'control_centre' %}<span class="eyebrow">STEP 1 · PREPARE</span><h2>Weekly Control Centre</h2><p>See what needs attention before you plan the next trip.</p>
+            {% elif view == 'route_planner' %}<span class="eyebrow">STEP 2 · BUILD ROUTE</span><h2>Customer Route Planner</h2><p>Select the territory, apply real-world constraints, and create a workable route.</p>
+            {% elif view == 'trip_prep' %}<span class="eyebrow">STEP 3 · FINALISE TRIP</span><h2>Trip Planning</h2><p>Confirm dates, appointments, brochures, travel and final readiness.</p>
+            {% elif view == 'trip_workspace' %}<span class="eyebrow">TRIP WORKSPACE</span><h2>Saved Trip</h2><p>Review the same trip as a schedule, map or calendar.</p>
+            {% elif view == 'on_the_road' %}<span class="eyebrow">STEP 4 · ON THE ROAD</span><h2>Today’s Calls</h2><p>Navigate, record visits, capture evidence and create follow-ups.</p>
+            {% elif view == 'follow_up' %}<span class="eyebrow">STEP 5 · CLOSE OUT</span><h2>After Trip</h2><p>Finish notes, assign actions and clear outstanding work.</p>
+            {% elif view in ['customer_priorities','customer_detail'] %}<span class="eyebrow">CUSTOMER HUB</span><h2>Customers</h2><p>Manage customer value, visit priority, history and open actions.</p>
+            {% elif view == 'settings' %}<span class="eyebrow">ADMINISTRATION</span><h2>Settings</h2><p>Manage customer records, route defaults and bulk updates.</p>
+            {% elif view == 'travel_expenses' %}<span class="eyebrow">TRAVEL</span><h2>Travel &amp; Expenses</h2><p>Track bookings, forecasts and actual trip costs.</p>
+            {% elif view in ['actions','action_form'] %}<span class="eyebrow">FOLLOW-UP</span><h2>Action Tracker</h2><p>Prioritise and complete work created from customer calls.</p>
+            {% else %}<span class="eyebrow">SALES PERFORMANCE</span><h2>Performance &amp; Opportunities</h2><p>Review results, trends, bonuses and store opportunities.</p>{% endif %}
+        </div>
+        <div class="context-next">
+            {% if view == 'control_centre' %}<a class="button-link" href="{{ url_for('route_planner') }}">Next: Build Route →</a>
+            {% elif view == 'route_planner' %}<a class="button-link" href="{{ url_for('trip_prep') }}">Next: Finalise Trip →</a>
+            {% elif view == 'trip_workspace' %}<a class="button-link" href="{{ url_for('on_the_road', trip_id=workspace.trip.id) }}">Next: On the Road →</a>{% elif view == 'trip_prep' %}<a class="button-link" href="{{ url_for('on_the_road') }}">Next: On the Road →</a>
+            {% elif view == 'on_the_road' %}<a class="button-link" href="{{ url_for('follow_up', trip_id=active_trip.id) if active_trip else url_for('follow_up') }}">Next: Close Out →</a>
+            {% elif view == 'follow_up' %}<a class="button-link secondary" href="{{ url_for('control_centre') }}">Return Home</a>{% endif %}
+        </div>
+    </section>
+
+
+
+    {% if view == 'settings' %}
+    <div class="panel">
+        <div class="heading-row"><div><h2>Reliability & Data Protection</h2><p>Keep trip data linked correctly, check database health, and manage automatic backups.</p></div></div>
+        <div class="mini-grid">
+            <div class="mini-card"><div class="label">Active trip</div><div class="value" style="font-size:18px;">{{ reliability.active_trip_name or 'None selected' }}</div><div class="small">Used by On the Road and Close Out</div></div>
+            <div class="mini-card"><div class="label">Data health</div><div class="value">{{ reliability.issue_count }}</div><div class="small">issue{% if reliability.issue_count != 1 %}s{% endif %} detected</div></div>
+            <div class="mini-card"><div class="label">Backups</div><div class="value">{{ reliability.backup_count }}</div><div class="small">Latest: {{ reliability.latest_backup or 'None yet' }}</div></div>
+        </div>
+        {% if reliability.issues %}<div class="error" style="margin-top:16px;"><strong>Data health findings</strong><ul>{% for issue in reliability.issues %}<li>{{ issue }}</li>{% endfor %}</ul></div>{% else %}<div class="success" style="margin-top:16px;">No structural data problems detected.</div>{% endif %}
+        <form method="post" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-top:16px;">
+            <input type="hidden" name="action" value="set_active_trip">
+            <label style="min-width:280px;">Active trip across the workflow<select name="active_trip_id"><option value="">None selected</option>{% for trip in reliability.trips %}<option value="{{ trip.id }}" {% if trip.id == reliability.active_trip_id %}selected{% endif %}>{{ trip.trip_name }} · {{ trip.start_date }}</option>{% endfor %}</select></label>
+            <button type="submit">Set Active Trip</button>
+        </form>
+        <div class="button-row" style="text-align:left;">
+            <form method="post" style="display:inline;"><input type="hidden" name="action" value="create_backup"><button type="submit">Create Backup Now</button></form>
+            <a class="button-link secondary" href="{{ url_for('data_health_report') }}">Download Health Report</a>
+        </div>
+        {% if reliability.backups %}<div class="table-wrap" style="margin-top:16px;"><table class="history-table"><thead><tr><th>Backup</th><th>Size</th><th></th></tr></thead><tbody>{% for backup in reliability.backups %}<tr><td>{{ backup.name }}</td><td>{{ backup.size }}</td><td><form method="post" action="{{ url_for('restore_backup', filename=backup.name) }}" onsubmit="return confirm('Restore this backup? The current database will be backed up first.');"><button class="danger" type="submit">Restore</button></form></td></tr>{% endfor %}</tbody></table></div>{% endif %}
+        {% if reliability.recent_audit %}<h3 style="margin-top:24px;">Recent Activity</h3><div class="table-wrap"><table class="history-table"><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead><tbody>{% for item in reliability.recent_audit %}<tr><td>{{ item.created_at }}</td><td>{{ item.event_type|replace('_',' ')|title }}</td><td>{{ item.detail }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+    </div>
+    <div class="panel">
+        <div class="heading-row">
+            <div><h2>Settings</h2><p>Manage customers and route-planning defaults from one place.</p></div>
+            <span class="change-badge change-neutral">{{ settings_customers|length }} customers</span>
+        </div>
+        {% if success %}<div class="success">{{ success }}</div>{% endif %}
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <div class="settings-section-grid" style="margin-top:18px;">
+            <div class="settings-category"><h3>Customer Data</h3><a href="#customer-management">Edit individual customers</a><a href="#bulk-edit">Bulk update customers</a><a href="{{ url_for('route_planner') }}">Import Portatour export</a></div>
+            <div class="settings-category"><h3>Route Defaults</h3><a href="#route-defaults">Rep and customer hours</a><a href="{{ url_for('route_planner') }}">Trip start and finish locations</a><a href="#customer-management">Call duration, cycle and priority</a></div>
+            <div class="settings-category"><h3>Related Tools</h3><a href="{{ url_for('customer_priorities') }}">Customer value and priorities</a><a href="{{ url_for('actions') }}">Action tracker</a><a href="{{ url_for('travel_expenses') }}">Travel and expense settings</a></div>
+        </div>
     </div>
 
+    <div class="panel" id="route-defaults">
+        <div class="heading-row"><div><h2>General Route Defaults</h2><p>These hours apply automatically to every new route. Individual customer trading hours and day-specific rep overrides can still take precedence.</p></div></div>
+        <form method="post">
+            <input type="hidden" name="action" value="save_route_defaults">
+            <div class="route-plan-grid">
+                <label>Rep working day starts<input type="time" name="route_rep_start" value="{{ route_defaults.rep_start }}" required></label>
+                <label>Rep working day finishes<input type="time" name="route_rep_end" value="{{ route_defaults.rep_end }}" required></label>
+                <label>Default customer opening<input type="time" name="route_customer_open" value="{{ route_defaults.customer_open }}" required></label>
+                <label>Default customer closing<input type="time" name="route_customer_close" value="{{ route_defaults.customer_close }}" required></label>
+            </div>
+            <p class="small" style="margin-top:12px;">A 30-minute lunch break is scheduled automatically at the most practical point between 11:00 am and 1:00 pm.</p>
+            <div class="button-row" style="text-align:left;"><button type="submit">Save Route Defaults</button></div>
+        </form>
+    </div>
+
+    <div class="panel" id="bulk-edit">
+        <div class="heading-row"><div><h2>Bulk Update Customers</h2><p>Tick customers in the table, then apply one or more values to all selected rows.</p></div><span id="selected-settings-count" class="change-badge change-neutral">0 selected</span></div>
+        <form method="post" id="bulk-settings-form">
+            <input type="hidden" name="action" value="bulk_update_customers">
+            <input type="hidden" name="selected_customer_ids" id="selected-customer-ids">
+            <div class="bulk-edit-grid">
+                <label>Call duration (minutes)<input type="number" name="bulk_call_minutes" min="10" max="240" step="5" placeholder="Leave unchanged"></label>
+                <label>Priority tier<select name="bulk_priority_tier"><option value="">Leave unchanged</option>{% for tier in ['A','B','C','D'] %}<option value="{{ tier }}">Tier {{ tier }}</option>{% endfor %}</select></label>
+                <label>Call cycle (days)<input type="number" name="bulk_call_interval" min="1" max="365" placeholder="Leave unchanged"></label>
+                <label>Customer group<select name="bulk_customer_group"><option value="">Leave unchanged</option>{% for group in settings_groups %}<option value="{{ group }}">{{ group }}</option>{% endfor %}</select></label>
+                <label>Visit status<select name="bulk_urgency"><option value="">Leave unchanged</option><option value="overdue">Overdue</option><option value="due">Due</option><option value="not due">Not due</option></select></label>
+                <label>Customer opens<input type="time" name="bulk_customer_open"></label>
+                <label>Customer closes<input type="time" name="bulk_customer_close"></label>
+                <button type="submit">Apply to Selected</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="panel" id="customer-management">
+        <div class="heading-row"><div><h2>Customer Management</h2><p>Edit names, addresses, visit durations, priority, call cycles and contact details. Save all visible changes together.</p></div><span id="unsaved-settings-note" class="unsaved-note">Unsaved changes</span></div>
+        <div class="customer-settings-toolbar">
+            <label>Search<input id="settings-search" type="search" placeholder="Customer, city, address or group"></label>
+            <label>Customer group<select id="settings-group-filter"><option value="">All groups</option>{% for group in settings_groups %}<option value="{{ group }}">{{ group }}</option>{% endfor %}</select></label>
+            <label>Priority tier<select id="settings-tier-filter"><option value="">All tiers</option>{% for tier in ['A','B','C','D'] %}<option value="{{ tier }}">Tier {{ tier }}</option>{% endfor %}</select></label>
+            <label>Visit status<select id="settings-status-filter"><option value="">All statuses</option><option value="overdue">Overdue</option><option value="due">Due</option><option value="not due">Not due</option></select></label>
+            <button id="select-visible-settings" type="button" class="secondary">Select Visible</button>
+        </div>
+        <form method="post" id="customer-settings-form" style="margin-top:16px;">
+            <input type="hidden" name="action" value="save_customer_table">
+            <div class="settings-table-wrap"><table class="customer-settings-table"><thead><tr><th class="checkbox-cell"><input id="settings-select-all" type="checkbox" aria-label="Select all visible customers"></th><th>Customer name</th><th>Street address</th><th>City</th><th>Postcode</th><th>Group</th><th>Tier</th><th>Call duration</th><th>Customer opens</th><th>Customer closes</th><th>Call cycle</th><th>Last call</th><th>Status</th><th>Phone</th><th>Email</th><th>Latitude</th><th>Longitude</th><th>Call note</th></tr></thead>
+            <tbody>{% for c in settings_customers %}<tr class="settings-customer-row" data-id="{{ c.id }}" data-search="{{ (c.name ~ ' ' ~ c.street ~ ' ' ~ c.city ~ ' ' ~ c.customer_group)|lower }}" data-group="{{ c.customer_group }}" data-tier="{{ c.priority_tier }}" data-status="{{ c.urgency }}">
+                <td class="checkbox-cell"><input class="settings-row-check" type="checkbox" value="{{ c.id }}"></td>
+                <td><input class="name-field" name="name_{{ c.id }}" value="{{ c.name }}" required></td>
+                <td><input class="address-field" name="street_{{ c.id }}" value="{{ c.street }}"></td>
+                <td><input class="city-field" name="city_{{ c.id }}" value="{{ c.city }}"></td>
+                <td><input name="zip_{{ c.id }}" value="{{ c.zip }}"></td>
+                <td><select name="customer_group_{{ c.id }}">{% for group in settings_groups %}<option value="{{ group }}" {% if group == c.customer_group %}selected{% endif %}>{{ group }}</option>{% endfor %}</select></td>
+                <td><select name="priority_tier_{{ c.id }}">{% for tier in ['A','B','C','D'] %}<option value="{{ tier }}" {% if tier == c.priority_tier %}selected{% endif %}>{{ tier }}</option>{% endfor %}</select></td>
+                <td><input class="number-field" type="number" name="ideal_call_minutes_{{ c.id }}" min="10" max="240" step="5" value="{{ c.ideal_call_minutes }}"></td>
+                <td><input type="time" name="customer_open_time_{{ c.id }}" value="{{ c.customer_open_time or '08:00' }}"></td>
+                <td><input type="time" name="customer_close_time_{{ c.id }}" value="{{ c.customer_close_time or '17:00' }}"></td>
+                <td><input class="number-field" type="number" name="call_interval_{{ c.id }}" min="1" max="365" value="{{ c.call_interval }}"></td>
+                <td><input type="date" name="last_call_{{ c.id }}" value="{{ c.last_call_date }}"></td>
+                <td><select name="urgency_{{ c.id }}"><option value="overdue" {% if c.urgency == 'overdue' %}selected{% endif %}>Overdue</option><option value="due" {% if c.urgency == 'due' %}selected{% endif %}>Due</option><option value="not due" {% if c.urgency == 'not due' %}selected{% endif %}>Not due</option></select></td>
+                <td><input name="phone_{{ c.id }}" value="{{ c.phone }}"></td>
+                <td><input name="email_{{ c.id }}" value="{{ c.email }}"></td>
+                <td><input class="number-field" type="number" step="0.000001" name="latitude_{{ c.id }}" value="{{ c.latitude }}"></td>
+                <td><input class="number-field" type="number" step="0.000001" name="longitude_{{ c.id }}" value="{{ c.longitude }}"></td>
+                <td><textarea name="call_note_{{ c.id }}">{{ c.call_note }}</textarea></td>
+            </tr>{% endfor %}</tbody></table></div>
+            <div class="button-row"><button type="submit">Save All Customer Changes</button></div>
+        </form>
+    </div>
+    <script>
+    (() => {
+        const rows = Array.from(document.querySelectorAll('.settings-customer-row'));
+        const search = document.getElementById('settings-search');
+        const group = document.getElementById('settings-group-filter');
+        const tier = document.getElementById('settings-tier-filter');
+        const status = document.getElementById('settings-status-filter');
+        const allCheck = document.getElementById('settings-select-all');
+        const count = document.getElementById('selected-settings-count');
+        const idsInput = document.getElementById('selected-customer-ids');
+        const bulkForm = document.getElementById('bulk-settings-form');
+        const mainForm = document.getElementById('customer-settings-form');
+        const unsaved = document.getElementById('unsaved-settings-note');
+        function applyFilters(){
+            const q=(search.value||'').trim().toLowerCase();
+            rows.forEach(row => {
+                const visible=(!q || row.dataset.search.includes(q)) && (!group.value || row.dataset.group===group.value) && (!tier.value || row.dataset.tier===tier.value) && (!status.value || row.dataset.status===status.value);
+                row.style.display=visible?'':'none';
+            });
+            updateSelection();
+        }
+        function updateSelection(){
+            const selected=rows.filter(r => r.querySelector('.settings-row-check').checked).map(r => r.dataset.id);
+            count.textContent=`${selected.length} selected`;
+            idsInput.value=selected.join(',');
+            const visible=rows.filter(r=>r.style.display!=='none');
+            allCheck.checked=visible.length>0 && visible.every(r=>r.querySelector('.settings-row-check').checked);
+            allCheck.indeterminate=visible.some(r=>r.querySelector('.settings-row-check').checked) && !allCheck.checked;
+        }
+        [search,group,tier,status].forEach(el=>el.addEventListener(el===search?'input':'change',applyFilters));
+        rows.forEach(row=>row.querySelector('.settings-row-check').addEventListener('change',updateSelection));
+        allCheck.addEventListener('change',()=>{ rows.filter(r=>r.style.display!=='none').forEach(r=>r.querySelector('.settings-row-check').checked=allCheck.checked); updateSelection(); });
+        document.getElementById('select-visible-settings').addEventListener('click',()=>{ rows.filter(r=>r.style.display!=='none').forEach(r=>r.querySelector('.settings-row-check').checked=true); updateSelection(); });
+        bulkForm.addEventListener('submit',e=>{ updateSelection(); if(!idsInput.value){e.preventDefault(); alert('Select at least one customer first.');} });
+        mainForm.addEventListener('input',()=>{unsaved.style.display='inline-block';});
+        mainForm.addEventListener('change',()=>{unsaved.style.display='inline-block';});
+        applyFilters();
+    })();
+    </script>
+    {% endif %}
+
+    {% if view == 'route_planner' %}
+    <div class="panel">
+        <div class="heading-row">
+            <div><h2>Customer Route Planner</h2><p>Select a territory, optimise the call order, and divide the route into practical working days.</p></div>
+            <span class="change-badge change-neutral">{{ map_customers|length }} mapped customers</span>
+        </div>
+        {% if success %}<div class="success">{{ success }}</div>{% endif %}
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="post" enctype="multipart/form-data" class="route-import">
+            <input type="hidden" name="action" value="import_customers">
+            <input type="file" name="customer_export" accept=".xlsx" required>
+            <button type="submit">Update from Portatour Export</button>
+            <span class="small">Existing customers are updated by Portatour ID or customer name.</span>
+        </form>
+    </div>
+
+    <div class="route-layout">
+        <div class="panel">
+            <div class="route-toolbar">
+                <input id="route-search" type="search" placeholder="Search customer, city or address">
+                <select id="route-group"><option value="">All customer groups</option>{% for group in route_groups %}<option value="{{ group }}">{{ group }}</option>{% endfor %}</select>
+                <select id="route-urgency"><option value="">All visit statuses</option><option value="overdue">Overdue</option><option value="due">Due</option><option value="not due">Not due</option></select>
+                <button id="fit-visible" type="button" class="secondary">Fit Visible</button>
+            </div>
+            <div id="map-mode-banner" class="map-mode-banner">Click the map to set the location.</div>
+            <div id="route-map" aria-label="Interactive customer map"></div>
+            <div class="map-legend"><span><i class="legend-pin pin-overdue"></i>Overdue</span><span><i class="legend-pin pin-due"></i>Due</span><span><i class="legend-pin pin-not-due"></i>Not due</span><span><i class="legend-pin pin-selected"></i>Selected</span></div>
+            <p class="small" style="margin-top:10px;">Draw around an area or click individual pins. The optimiser uses free road-routing when available and automatically falls back to a local distance calculation.</p>
+
+            <div class="route-planning-panel">
+                <h3>Build the Route</h3>
+                <div class="route-plan-grid">
+                    <label>Start location
+                        <div class="route-location-row"><input id="start-label" value="Hamilton" placeholder="Start location"><button id="set-start" type="button" class="secondary">Set on map</button></div>
+                    </label>
+                    <label>End location
+                        <div class="route-location-row"><input id="end-label" value="Hamilton" placeholder="End location"><button id="set-end" type="button" class="secondary">Set on map</button></div>
+                    </label>
+                    <label>Number of days<select id="route-days"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option></select></label>
+                    <label class="route-check"><input id="same-end" type="checkbox" checked> Finish each day at start</label>
+                    <div class="route-default-summary" style="grid-column:1 / -1;display:flex;gap:18px;flex-wrap:wrap;padding:12px 14px;border:1px solid #d0d5dd;border-radius:10px;background:white;">
+                        <span><strong>Rep hours:</strong> {{ route_defaults.rep_start }}–{{ route_defaults.rep_end }}</span>
+                        <span><strong>Customer hours:</strong> {{ route_defaults.customer_open }}–{{ route_defaults.customer_close }}</span>
+                        <span><strong>Lunch:</strong> automatic 30 minutes between 11:00–13:00</span>
+                        <a href="{{ url_for('settings') }}#route-defaults">Change defaults</a>
+                    </div>
+                    <input id="rep-start" type="hidden" value="{{ route_defaults.rep_start }}">
+                    <input id="rep-end" type="hidden" value="{{ route_defaults.rep_end }}">
+                    <input id="customer-open" type="hidden" value="{{ route_defaults.customer_open }}">
+                    <input id="customer-close" type="hidden" value="{{ route_defaults.customer_close }}">
+                    <label class="route-check"><input id="overnight-mode" type="checkbox"> Stay overnight and continue from the previous day's final call</label>
+                    <label>Default call duration<input id="default-visit-minutes" type="number" min="10" max="240" step="5" value="45"><span class="small">Only used where a customer has no saved duration.</span></label>
+                    <label>Route preference<select id="route-preference"><option value="fastest">Fastest practical order</option><option value="priority">Overdue customers first</option></select></label>
+                </div>
+                <div class="route-day-settings" style="margin-top:18px;">
+                    <h3 style="margin-bottom:8px;">Daily rep hours</h3>
+                    <p class="small">Override the rep's working window only where a particular day differs from the general Settings defaults.</p>
+                    <div id="daily-hours-grid" class="daily-hours-grid"></div>
+                </div>
+                <div class="route-lock-panel" style="margin-top:18px;padding:16px;border:1px solid #e4e7ec;border-radius:10px;background:#f8fafc;">
+                    <div class="heading-row"><div><h3 style="margin:0;">Locked &amp; preferred appointments</h3><p class="small" style="margin:4px 0 0;">Fix confirmed calls to a day and time, or mark a preferred time that the optimiser will try to honour.</p></div><button id="add-lock" type="button" class="secondary">Add Appointment</button></div>
+                    <div id="locked-appointments" style="margin-top:12px;"></div>
+                </div>
+                <div class="route-actions">
+                    <button id="optimise-route" type="button">Optimise &amp; Build Days</button>
+                    <button id="clear-route" type="button" class="secondary">Clear Route Lines</button>
+                </div>
+                <div id="route-status" class="route-status">Select customers, confirm the start point, then build the route.</div>
+                <div id="route-result" class="route-result"></div>
+                <form id="route-workflow-form" method="post" class="route-workflow-form" style="display:none;">
+                    <input type="hidden" name="action" value="create_trip_from_route">
+                    <input type="hidden" name="route_payload" id="route-payload">
+                    <input type="hidden" name="route_destination" id="route-destination">
+                    <div class="route-workflow-grid">
+                        <label>Trip name<input type="text" name="trip_name" id="workflow-trip-name" placeholder="e.g. Lower North Island trip" required></label>
+                        <label>First day<input type="date" name="trip_start_date" id="workflow-start-date" required></label>
+                        <label>Final day<input type="date" name="trip_end_date" id="workflow-end-date" readonly></label>
+                        <button type="submit">Send to Plan Trip</button>
+                    </div>
+                    <p class="small" style="margin:10px 0 0;">Creates the trip, appointments, brochure list, customer briefs and On the Road schedule from this route.</p>
+                </form>
+            </div>
+        </div>
+
+        <div class="panel route-side">
+            <h2 style="margin-bottom:12px;">Selected Calls</h2>
+            <div class="route-summary">
+                <div class="route-mini"><span class="small">Selected</span><strong id="selected-count">0</strong></div>
+                <div class="route-mini"><span class="small">Overdue</span><strong id="selected-overdue">0</strong></div>
+                <div class="route-mini"><span class="small">Groups</span><strong id="selected-groups">0</strong></div>
+            </div>
+            <div id="selected-list" class="selected-list"><div class="empty">Draw around customers or click pins to select them.</div></div>
+            <div class="route-actions"><button id="select-visible" type="button">Select Visible</button><button id="clear-selection" type="button" class="secondary">Clear</button></div>
+            <form method="post" id="save-route-form">
+                <input type="hidden" name="action" value="save_selection">
+                <input type="hidden" name="selected_ids" id="selected-ids">
+                <div class="route-save-grid">
+                    <input type="text" name="selection_name" placeholder="e.g. Coromandel trip" required>
+                    <input type="date" name="start_date">
+                    <input type="date" name="end_date">
+                </div>
+                <div class="button-row" style="text-align:left;margin-top:10px;"><button type="submit">Save Selection</button></div>
+            </form>
+            {% if saved_route_selections %}
+            <h3 style="margin:20px 0 5px;">Saved Selections</h3>
+            {% for item in saved_route_selections %}
+            <div class="saved-route-row">
+                <div><strong>{{ item.name }}</strong><br><span class="small">{{ item.count }} customers{% if item.date_display %} · {{ item.date_display }}{% endif %}</span></div>
+                <div class="saved-route-actions">
+                    <button type="button" class="secondary load-route" data-ids="{{ item.customer_ids }}">Load</button>
+                    <form method="post" action="{{ url_for('delete_route_selection', selection_id=item.id) }}" onsubmit="return confirm('Delete this saved route selection?');">
+                        <button type="submit" class="compact-danger">Delete</button>
+                    </form>
+                </div>
+            </div>
+            {% endfor %}
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="heading-row"><div><h2>Customer Route Settings</h2><p>Set the normal on-site time for each customer. The optimiser uses this saved duration every time that customer is planned.</p></div></div>
+        <form method="post" class="plan-form-grid" style="max-width:900px;">
+            <input type="hidden" name="action" value="save_customer_route_settings">
+            <label>Customer<select name="customer_id" id="settings-customer" required><option value="">Choose customer</option>{% for customer in map_customers %}<option value="{{ customer.id }}" data-duration="{{ customer.ideal_call_minutes or 45 }}">{{ customer.name }}{% if customer.city %} — {{ customer.city }}{% endif %}</option>{% endfor %}</select></label>
+            <label>Standard call duration (minutes)<input type="number" name="ideal_call_minutes" id="settings-duration" min="10" max="240" step="5" value="45" required></label>
+            <div class="button-row" style="text-align:left;align-self:end;"><button type="submit">Save Customer Duration</button></div>
+        </form>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    <script>
+    (() => {
+        const customers = {{ map_customers|tojson }};
+        const customerById = new Map(customers.map(c => [Number(c.id), c]));
+        const map = L.map('route-map', { preferCanvas: true }).setView([-38.2, 175.7], 7);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+        const drawnItems = new L.FeatureGroup().addTo(map);
+        const routeLayers = new L.FeatureGroup().addTo(map);
+        map.addControl(new L.Control.Draw({ draw:{polyline:false,rectangle:true,circle:false,circlemarker:false,marker:false,polygon:{allowIntersection:false,showArea:true}}, edit:{featureGroup:drawnItems,remove:true} }));
+        const selected = new Set();
+        let routeOrder = [];
+        const markerById = new Map();
+        const visibleIds = new Set();
+        const search = document.getElementById('route-search');
+        const group = document.getElementById('route-group');
+        const urgency = document.getElementById('route-urgency');
+        const list = document.getElementById('selected-list');
+        const idsInput = document.getElementById('selected-ids');
+        const statusBox = document.getElementById('route-status');
+        const resultBox = document.getElementById('route-result');
+        const modeBanner = document.getElementById('map-mode-banner');
+        const dayColours = ['#246fe5','#7f56d9','#f79009','#12b76a','#d92d20'];
+        let mapPickMode = '';
+        let startPoint = {lat:-37.7870,lng:175.2793,label:'Hamilton'};
+        let endPoint = {...startPoint};
+        let startMarker = null;
+        let endMarker = null;
+        let currentDays = [];
+        let currentUnassigned = [];
+
+        function esc(value){ return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch])); }
+        function markerColour(c){ if(selected.has(Number(c.id))) return '#246fe5'; if(c.urgency==='overdue') return '#d92d20'; if(c.urgency==='due') return '#f79009'; if(c.urgency==='not due') return '#12b76a'; return '#667085'; }
+        function icon(c){ return L.divIcon({className:'',html:`<div style="width:16px;height:16px;border-radius:50%;background:${markerColour(c)};border:2px solid white;box-shadow:0 0 0 1px #475467;"></div>`,iconSize:[16,16],iconAnchor:[8,8]}); }
+        function matches(c){ const q=search.value.trim().toLowerCase(); return (!q || `${c.name} ${c.city} ${c.street}`.toLowerCase().includes(q)) && (!group.value || c.customer_group===group.value) && (!urgency.value || c.urgency===urgency.value); }
+        function popup(c){ const address=[c.street,c.city,c.zip].filter(Boolean).join(', '); return `<strong>${esc(c.name)}</strong><br>${esc(c.customer_group)}<br>${esc(address)}<br><span style="text-transform:capitalize">${esc(c.urgency||'No status')}</span>${c.last_call?` · Last call ${esc(c.last_call)}`:''}${c.call_note?`<br><em>${esc(c.call_note)}</em>`:''}`; }
+        function renderMarkers(){ visibleIds.clear(); customers.forEach(c=>{ const m=markerById.get(Number(c.id)); if(matches(c)){ if(!map.hasLayer(m)) m.addTo(map); visibleIds.add(Number(c.id)); } else if(map.hasLayer(m)) map.removeLayer(m); m.setIcon(icon(c)); }); }
+        function chosenInDisplayOrder(){ const ids = routeOrder.length ? routeOrder.filter(id=>selected.has(id)) : [...selected]; const missing=[...selected].filter(id=>!ids.includes(id)); return [...ids,...missing].map(id=>customerById.get(id)).filter(Boolean); }
+        function updateSelection(){ const chosen=chosenInDisplayOrder(); routeOrder=chosen.map(c=>Number(c.id)); idsInput.value=routeOrder.join(','); document.getElementById('selected-count').textContent=chosen.length; document.getElementById('selected-overdue').textContent=chosen.filter(c=>c.urgency==='overdue').length; document.getElementById('selected-groups').textContent=new Set(chosen.map(c=>c.customer_group)).size; if(!chosen.length){list.innerHTML='<div class="empty">Draw around customers or click pins to select them.</div>';} else { list.innerHTML=chosen.map((c,i)=>`<div class="selected-customer"><div><strong>${i+1}. ${esc(c.name)}</strong><br><span class="small">${esc(c.city||'')} · ${esc(c.customer_group)} · ${esc(c.urgency||'no status')} · ${visitDuration(c)} min standard call</span><div class="route-reorder"><button type="button" data-up="${c.id}" ${i===0?'disabled':''}>↑</button><button type="button" data-down="${c.id}" ${i===chosen.length-1?'disabled':''}>↓</button></div></div><button type="button" data-remove="${c.id}">Remove</button></div>`).join(''); } document.querySelectorAll('.lock-customer').forEach(sel=>{const v=sel.value;sel.innerHTML=lockCustomerOptions();sel.value=v;}); renderMarkers(); }
+        function toggle(id){ id=Number(id); selected.has(id)?selected.delete(id):selected.add(id); routeOrder=routeOrder.filter(x=>x!==id); if(selected.has(id)) routeOrder.push(id); clearRouteDisplay(); updateSelection(); }
+        customers.forEach(c=>{ const id=Number(c.id); const m=L.marker([c.latitude,c.longitude],{icon:icon(c),title:c.name}); m.bindPopup(popup(c)); m.on('click',()=>toggle(id)); markerById.set(id,m); });
+        renderMarkers();
+
+        function setStatus(message,isError=false){ statusBox.textContent=message; statusBox.classList.toggle('error-state',isError); }
+        function formatMinutes(total){ total=Math.max(0,Math.round(total)); const h=Math.floor(total/60),m=total%60; return h?`${h}h ${m}m`:`${m}m`; }
+        function formatDistance(km){ return km>=100?`${Math.round(km)} km`:`${km.toFixed(1)} km`; }
+        function timeToMinutes(value){ const [h,m]=value.split(':').map(Number); return h*60+m; }
+        function clock(minutes){ minutes=Math.round(minutes); const h=Math.floor(minutes/60)%24,m=minutes%60; return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`; }
+        function visitDuration(c){ const fallback=Math.max(10,Number(document.getElementById('default-visit-minutes').value)||45); return Math.max(10,Number(c.ideal_call_minutes)||fallback); }
+        function customerWindow(c,defaultOpen,defaultClose){
+            const open=c.customer_open_time?timeToMinutes(c.customer_open_time):defaultOpen;
+            const close=c.customer_close_time?timeToMinutes(c.customer_close_time):defaultClose;
+            return {open,close};
+        }
+        function scheduleFromLegs(stops,legs,config,locksById){
+            const lunchWindowStart=11*60, lunchLatestStart=12*60+30, lunchDuration=30;
+            let cursor=config.repStart,totalVisit=0,totalWait=0,lunchTaken=false,lunchAt=null; const timings=[];
+            for(let i=0;i<stops.length;i++){
+                const drive=legs?.[i]?.duration?legs[i].duration/60:0; cursor+=drive;
+                const c=stops[i], win=customerWindow(c,config.customerOpen,config.customerClose), lock=locksById.get(Number(c.id));
+                let arrival=Math.max(cursor,win.open), wait=Math.max(0,win.open-cursor), locked=false;
+                const duration=visitDuration(c);
+                if(lock){
+                    const target=lock.timeMinutes;
+                    if(lock.kind==='locked' && cursor>target+0.5)return {fits:false,timings,finish:cursor,totalVisit,totalWait,reason:`Cannot reach ${c.name} by ${clock(target)}`};
+                    if(lock.kind==='locked'){arrival=target;locked=true;wait=Math.max(0,target-cursor);}
+                    else if(cursor<=target) {arrival=Math.max(arrival,target);wait=Math.max(0,arrival-cursor);}
+                }
+                if(!lunchTaken){
+                    const naturalLunchStart=Math.max(cursor,lunchWindowStart);
+                    if(naturalLunchStart<=lunchLatestStart && naturalLunchStart+lunchDuration<=arrival){
+                        lunchTaken=true;lunchAt=naturalLunchStart;
+                    }else if(arrival>lunchLatestStart || arrival+duration>13*60){
+                        const forcedLunchStart=Math.max(cursor,lunchWindowStart);
+                        if(forcedLunchStart<=lunchLatestStart){
+                            lunchTaken=true;lunchAt=forcedLunchStart;
+                            arrival=Math.max(arrival,forcedLunchStart+lunchDuration);
+                            wait=Math.max(0,arrival-cursor-lunchDuration);
+                        }
+                    }
+                }
+                const depart=arrival+duration;
+                if(arrival<win.open || depart>win.close)return {fits:false,timings,finish:depart,totalVisit,totalWait,reason:`${c.name} falls outside its ${clock(win.open)}–${clock(win.close)} customer hours`};
+                if(depart>config.repEnd)return {fits:false,timings,finish:depart,totalVisit,totalWait,reason:`Rep hours exceeded at ${c.name}`};
+                timings.push({arrival,depart,duration,drive,wait,locked,kind:lock?.kind||''}); cursor=depart; totalVisit+=duration; totalWait+=wait;
+            }
+            if(!lunchTaken && cursor>=lunchWindowStart){
+                const finalLunchStart=Math.max(lunchWindowStart,Math.min(cursor,lunchLatestStart));
+                if(finalLunchStart<=lunchLatestStart){cursor=Math.max(cursor,finalLunchStart)+lunchDuration;lunchTaken=true;lunchAt=finalLunchStart;}
+            }
+            const returnDrive=config.skipReturn?0:(legs?.[stops.length]?.duration?legs[stops.length].duration/60:0); cursor+=returnDrive;
+            return {fits:cursor<=config.repEnd,timings,finish:cursor,totalVisit,totalWait,returnDrive,lunchAt,reason:cursor<=config.repEnd?'':'Return drive exceeds rep finish time'};
+        }
+        function haversine(a,b){ const R=6371,rad=x=>x*Math.PI/180; const dLat=rad(b.lat-a.lat),dLon=rad(b.lng-a.lng); const q=Math.sin(dLat/2)**2+Math.cos(rad(a.lat))*Math.cos(rad(b.lat))*Math.sin(dLon/2)**2; return 2*R*Math.asin(Math.sqrt(q)); }
+        function nearestNeighbour(items,start,priorityFirst){ const remaining=[...items],ordered=[]; let current=start; while(remaining.length){ remaining.sort((a,b)=>{ if(priorityFirst){const rank=x=>x.urgency==='overdue'?0:x.urgency==='due'?1:2; const d=rank(a)-rank(b); if(d) return d;} return haversine(current,{lat:a.latitude,lng:a.longitude})-haversine(current,{lat:b.latitude,lng:b.longitude}); }); const next=remaining.shift(); ordered.push(next); current={lat:next.latitude,lng:next.longitude}; } return ordered; }
+        function clearRouteDisplay(){ routeLayers.clearLayers(); resultBox.innerHTML=''; currentDays=[]; currentUnassigned=[]; }
+        function setEndpoint(kind,latlng,label){ const point={lat:latlng.lat,lng:latlng.lng,label:label||`${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`}; if(kind==='start'){startPoint=point;document.getElementById('start-label').value=point.label;if(startMarker)map.removeLayer(startMarker);startMarker=L.marker(latlng,{title:'Route start'}).addTo(map).bindPopup('<strong>Route start</strong>'); if(document.getElementById('same-end').checked){endPoint={...point};document.getElementById('end-label').value=point.label;updateEndMarker();}} else {endPoint=point;document.getElementById('end-label').value=point.label;updateEndMarker();} }
+        function updateEndMarker(){ if(endMarker)map.removeLayer(endMarker); if(!document.getElementById('same-end').checked){endMarker=L.marker([endPoint.lat,endPoint.lng],{title:'Route finish'}).addTo(map).bindPopup('<strong>Route finish</strong>');} }
+        setEndpoint('start',L.latLng(startPoint.lat,startPoint.lng),'Hamilton');
+
+        document.getElementById('set-start').addEventListener('click',()=>{mapPickMode='start';modeBanner.textContent='Click the map to set the route start.';modeBanner.classList.add('active');});
+        document.getElementById('set-end').addEventListener('click',()=>{document.getElementById('same-end').checked=false;mapPickMode='end';modeBanner.textContent='Click the map to set the route finish.';modeBanner.classList.add('active');});
+        document.getElementById('same-end').addEventListener('change',e=>{if(e.target.checked){endPoint={...startPoint};document.getElementById('end-label').value=document.getElementById('start-label').value;}updateEndMarker();});
+        map.on('click',e=>{if(!mapPickMode)return;setEndpoint(mapPickMode,e.latlng);mapPickMode='';modeBanner.classList.remove('active');});
+
+        async function osrmTrip(chosen){
+            const coords=[startPoint,...chosen.map(c=>({lat:c.latitude,lng:c.longitude})),endPoint];
+            const coordText=coords.map(p=>`${p.lng},${p.lat}`).join(';');
+            const url=`https://router.project-osrm.org/trip/v1/driving/${coordText}?source=first&destination=last&roundtrip=false&overview=false&steps=false`;
+            const response=await fetch(url); if(!response.ok)throw new Error(`Routing service returned ${response.status}`); const data=await response.json(); if(data.code!=='Ok'||!data.trips?.length)throw new Error(data.message||'No route found');
+            const sequence=data.waypoints.map((w,inputIndex)=>({inputIndex,waypointIndex:w.waypoint_index})).sort((a,b)=>a.waypointIndex-b.waypointIndex);
+            const ordered=sequence.filter(x=>x.inputIndex>0&&x.inputIndex<coords.length-1).map(x=>chosen[x.inputIndex-1]);
+            return {ordered, legs:data.trips[0].legs||[]};
+        }
+        function urgencyRank(c){ return c.urgency==='overdue'?0:c.urgency==='due'?1:2; }
+        function dayConfig(dayIndex){
+            const row=document.querySelector(`[data-day-config="${dayIndex}"]`);
+            const defaultStart=timeToMinutes(document.getElementById('rep-start').value), defaultEnd=timeToMinutes(document.getElementById('rep-end').value);
+            return {repStart:timeToMinutes(row?.querySelector('.day-rep-start').value||document.getElementById('rep-start').value),repEnd:timeToMinutes(row?.querySelector('.day-rep-end').value||document.getElementById('rep-end').value),customerOpen:timeToMinutes(document.getElementById('customer-open').value),customerClose:timeToMinutes(document.getElementById('customer-close').value),skipReturn:document.getElementById('overnight-mode').checked && dayIndex<Number(document.getElementById('route-days').value)-1,defaultStart,defaultEnd};
+        }
+        function readLocks(){
+            const locks=[];
+            document.querySelectorAll('.locked-row').forEach(row=>{const customerId=Number(row.querySelector('.lock-customer').value),dayIndex=Number(row.querySelector('.lock-day').value)-1,time=row.querySelector('.lock-time').value,kind=row.querySelector('.lock-kind').value;if(customerId&&time)locks.push({customerId,dayIndex,time,timeMinutes:timeToMinutes(time),kind});});
+            return locks;
+        }
+        function estimatedLegs(stops,start,finish){const points=[start,...stops.map(c=>({lat:c.latitude,lng:c.longitude})),finish];return points.slice(1).map((p,i)=>{const km=haversine(points[i],p)*1.28;return {distance:km*1000,duration:(km/67)*3600};});}
+        function estimatedSchedule(stops,config,locksById,start,finish){return scheduleFromLegs(stops,estimatedLegs(stops,start,finish),config,locksById);}
+        function bestInsertion(remaining,dayStops,config,locksById,start,finish,priorityFirst){
+            let best=null;
+            const candidates=[...remaining].sort((a,b)=>priorityFirst?urgencyRank(a)-urgencyRank(b):0);
+            for(const candidate of candidates){
+                for(let pos=0;pos<=dayStops.length;pos++){
+                    const proposed=[...dayStops.slice(0,pos),candidate,...dayStops.slice(pos)];
+                    const sch=estimatedSchedule(proposed,config,locksById,start,finish);
+                    if(sch.fits && (!best || sch.finish<best.finish))best={candidate,pos,finish:sch.finish};
+                }
+            }
+            return best;
+        }
+        async function buildPracticalDays(chosen,maxDays,priorityFirst){
+            const allLocks=readLocks(), lockCustomerIds=new Set(allLocks.map(x=>x.customerId));
+            const invalidLocks=allLocks.filter(x=>x.dayIndex<0||x.dayIndex>=maxDays||!chosen.some(c=>Number(c.id)===x.customerId));
+            if(invalidLocks.length)throw new Error('A locked appointment refers to an unselected customer or a day outside this trip.');
+            const remaining=chosen.filter(c=>!lockCustomerIds.has(Number(c.id))),built=[];
+            let dayStart={...startPoint};
+            for(let dayIndex=0;dayIndex<maxDays;dayIndex++){
+                const config=dayConfig(dayIndex), dayLocks=allLocks.filter(x=>x.dayIndex===dayIndex), locksById=new Map(dayLocks.map(x=>[x.customerId,x]));
+                let dayStops=dayLocks.sort((a,b)=>a.timeMinutes-b.timeMinutes).map(x=>chosen.find(c=>Number(c.id)===x.customerId)).filter(Boolean);
+                const finish=config.skipReturn?(dayStops.length?{lat:dayStops[dayStops.length-1].latitude,lng:dayStops[dayStops.length-1].longitude}:dayStart):(document.getElementById('same-end').checked?startPoint:endPoint);
+                while(remaining.length){const best=bestInsertion(remaining,dayStops,config,locksById,dayStart,finish,priorityFirst);if(!best)break;dayStops.splice(best.pos,0,best.candidate);remaining.splice(remaining.indexOf(best.candidate),1);}
+                if(!dayStops.length)continue;
+                let route=await routeDay(dayStops,dayStart,finish), schedule=scheduleFromLegs(dayStops,route.legs,config,locksById);
+                while(dayStops.length&&!schedule.fits){
+                    let removeIndex=-1;for(let i=dayStops.length-1;i>=0;i--){if(!locksById.has(Number(dayStops[i].id))){removeIndex=i;break;}}
+                    if(removeIndex<0)throw new Error(schedule.reason||`Locked appointments on Day ${dayIndex+1} cannot fit.`);
+                    const [removed]=dayStops.splice(removeIndex,1);remaining.unshift(removed);route=await routeDay(dayStops,dayStart,finish);schedule=scheduleFromLegs(dayStops,route.legs,config,locksById);
+                }
+                if(dayStops.length){built.push({stops:dayStops,...route,schedule,config,locksById,startPoint:{...dayStart},finishPoint:{...finish}});if(config.skipReturn){const last=dayStops[dayStops.length-1];dayStart={lat:last.latitude,lng:last.longitude,label:last.name};}}
+            }
+            return {days:built,unassigned:remaining};
+        }
+        async function routeDay(stops,start=startPoint,finish=(document.getElementById('same-end').checked?startPoint:endPoint)){ const points=[start,...stops.map(c=>({lat:c.latitude,lng:c.longitude})),finish]; const coordText=points.map(p=>`${p.lng},${p.lat}`).join(';'); try{ const response=await fetch(`https://router.project-osrm.org/route/v1/driving/${coordText}?overview=full&geometries=geojson&steps=false`); if(!response.ok)throw new Error(); const data=await response.json(); if(data.code!=='Ok'||!data.routes?.length)throw new Error(); const r=data.routes[0]; return {distanceKm:r.distance/1000,driveMinutes:r.duration/60,geometry:r.geometry,legs:r.legs||[],source:'road'}; }catch(error){ let km=0;const legs=[];for(let i=1;i<points.length;i++){const legKm=haversine(points[i-1],points[i])*1.28;km+=legKm;legs.push({distance:legKm*1000,duration:(legKm/67)*3600});}return {distanceKm:km,driveMinutes:legs.reduce((n,l)=>n+l.duration/60,0),geometry:{coordinates:points.map(p=>[p.lng,p.lat])},legs,source:'estimate'};} }
+        function googleMapsUrl(stops){ const destination=document.getElementById('same-end').checked?startPoint:endPoint; const waypoints=stops.map(c=>`${c.latitude},${c.longitude}`).join('|'); return `https://www.google.com/maps/dir/?api=1&origin=${startPoint.lat},${startPoint.lng}&destination=${destination.lat},${destination.lng}&travelmode=driving&waypoints=${encodeURIComponent(waypoints)}`; }
+        async function buildRoute(){
+            clearRouteDisplay(); const chosen=[...selected].map(id=>customerById.get(id)).filter(Boolean); if(!chosen.length){setStatus('Select at least one customer first.',true);return;} if(chosen.length>40){setStatus('Please optimise no more than 40 calls at once. Split a very large territory into separate trips.',true);return;}
+            const repStart=timeToMinutes(document.getElementById('rep-start').value),repEnd=timeToMinutes(document.getElementById('rep-end').value),customerOpen=timeToMinutes(document.getElementById('customer-open').value),customerClose=timeToMinutes(document.getElementById('customer-close').value);
+            if(repEnd<=repStart){setStatus('The default rep finish time must be later than the start time.',true);return;} if(customerClose<=customerOpen){setStatus('Default customer closing time must be later than opening time.',true);return;}
+            const days=Math.max(1,Number(document.getElementById('route-days').value)||1); const priorityFirst=document.getElementById('route-preference').value==='priority';
+            setStatus('Optimising road order, customer call lengths, trading hours and rep driving hours…'); document.getElementById('optimise-route').disabled=true;
+            let seedOrder,fallback=false;
+            try{ const trip=await osrmTrip(chosen); seedOrder=trip.ordered; }catch(error){seedOrder=nearestNeighbour(chosen,startPoint,priorityFirst);fallback=true;}
+            if(priorityFirst)seedOrder=nearestNeighbour(seedOrder,startPoint,true);
+            try{
+                const practical=await buildPracticalDays(seedOrder,days,priorityFirst);
+                currentDays=practical.days; currentUnassigned=practical.unassigned; routeOrder=[...currentDays.flatMap(d=>d.stops),...currentUnassigned].map(c=>Number(c.id));updateSelection();
+                renderRouteResults(repStart,repEnd,customerOpen,customerClose,fallback);
+            }catch(error){setStatus(error.message||'Could not build the route.',true);}
+            document.getElementById('optimise-route').disabled=false;
+        }
+        function renderRouteResults(repStart,repEnd,customerOpen,customerClose,fallback){
+            routeLayers.clearLayers(); let totalKm=0,totalDrive=0,totalVisit=0; const bounds=[[startPoint.lat,startPoint.lng]];
+            currentDays.forEach((day,index)=>{totalKm+=day.distanceKm;totalDrive+=day.driveMinutes;totalVisit+=day.schedule.totalVisit;const coords=day.geometry.coordinates.map(p=>[p[1],p[0]]);const line=L.polyline(coords,{color:dayColours[index%dayColours.length],weight:5,opacity:.82,className:'route-line'}).addTo(routeLayers);bounds.push(...coords);line.bindTooltip(`Day ${index+1}: ${formatDistance(day.distanceKm)}`);});
+            if(bounds.length>1)map.fitBounds(bounds,{padding:[30,30]});
+            let html=`<div class="route-result-summary"><div class="route-mini"><span class="small">Planned days</span><strong>${currentDays.length}</strong></div><div class="route-mini"><span class="small">Calls</span><strong>${currentDays.reduce((n,d)=>n+d.stops.length,0)}</strong></div><div class="route-mini"><span class="small">Distance</span><strong>${formatDistance(totalKm)}</strong></div><div class="route-mini"><span class="small">Drive / visits</span><strong>${formatMinutes(totalDrive)} / ${formatMinutes(totalVisit)}</strong></div></div>`;
+            currentDays.forEach((day,dayIndex)=>{html+=`<div class="route-day"><div class="route-day-header"><div><strong>Day ${dayIndex+1}</strong><br><span class="small">${day.stops.length} calls · ${formatDistance(day.distanceKm)} · ${formatMinutes(day.driveMinutes)} driving · ${formatMinutes(day.schedule.totalVisit)} in calls · rep ${clock(day.config.repStart)}–${clock(day.config.repEnd)} · lunch ${day.schedule.lunchAt!==null?clock(day.schedule.lunchAt):'not required'} · finish about ${clock(day.schedule.finish)}</span></div><a href="${googleMapsUrl(day.stops)}" target="_blank" rel="noopener">Open in Google Maps</a></div>`;day.stops.forEach((c,i)=>{const t=day.schedule.timings[i];html+=`<div class="route-stop"><div class="route-stop-number">${i+1}</div><div><strong>${esc(c.name)}</strong><br><span class="small">${esc(c.city||'')} · ${esc(c.customer_group)} · ${esc(c.urgency||'no status')}</span><div class="route-context">${c.priority_classification?`<span>${esc(c.priority_classification)}</span>`:''}${Number(c.open_action_count||0)?`<span>${c.open_action_count} open action${Number(c.open_action_count)===1?'':'s'}</span>`:''}${c.call_note?`<span>Call note available</span>`:''}</div></div><div class="route-stop-time">${clock(t.arrival)}–${clock(t.depart)}<br>${t.duration} min visit${t.locked?' · LOCKED':t.kind==='preferred'?' · preferred':''}${t.wait?` · ${Math.round(t.wait)} min wait`:''}</div></div>`;});html+='</div>';});
+            if(currentUnassigned.length){html+=`<div class="route-day" style="border-color:#f79009;"><div class="route-day-header" style="background:#b54708;"><div><strong>Unscheduled calls</strong><br><span class="small">${currentUnassigned.length} calls cannot fit inside ${currentDays.length} day${currentDays.length===1?'':'s'} while respecting rep hours, customer hours, driving and saved call durations.</span></div></div>${currentUnassigned.map((c,i)=>`<div class="route-stop"><div class="route-stop-number">${i+1}</div><div><strong>${esc(c.name)}</strong><br><span class="small">${esc(c.city||'')} · ${visitDuration(c)} min standard call</span></div><div class="route-stop-time">Not scheduled</div></div>`).join('')}</div>`;}
+            resultBox.innerHTML=html;
+            const workflowForm=document.getElementById('route-workflow-form');
+            if(currentDays.length){
+                const payload={start_point:startPoint,end_point:document.getElementById('same-end').checked?startPoint:endPoint,rep_start:clock(repStart),rep_end:clock(repEnd),customer_open:clock(customerOpen),customer_close:clock(customerClose),overnight_mode:document.getElementById('overnight-mode').checked,locked_appointments:readLocks(),days:currentDays.map((day,dayIndex)=>({day_index:dayIndex,rep_start:clock(day.config.repStart),rep_end:clock(day.config.repEnd),start_point:day.startPoint,finish_point:day.finishPoint,stops:day.stops.map((c,i)=>({customer_id:Number(c.id),name:c.name,city:c.city||'',customer_group:c.customer_group||'',arrival:clock(day.schedule.timings[i].arrival),departure:clock(day.schedule.timings[i].depart),duration:Number(day.schedule.timings[i].duration),locked:Boolean(day.schedule.timings[i].locked),appointment_kind:day.schedule.timings[i].kind||'',call_note:c.call_note||''}))}))};
+                document.getElementById('route-payload').value=JSON.stringify(payload);
+                document.getElementById('route-destination').value=[...new Set(currentDays.flatMap(d=>d.stops.map(c=>c.city).filter(Boolean)))].slice(0,5).join(', ');
+                workflowForm.style.display='block';
+            } else workflowForm.style.display='none';
+            const estimated=currentDays.some(d=>d.source==='estimate')||fallback;if(currentUnassigned.length)setStatus(`${currentDays.reduce((n,d)=>n+d.stops.length,0)} calls fit; ${currentUnassigned.length} remain unscheduled.`,true);else setStatus(estimated?'Route fits the time rules. Some road times are estimates because the free routing service was unavailable.':'Route fits rep hours, customer trading hours and each customer’s saved call duration.');
+        }
+
+        const workflowStart=document.getElementById('workflow-start-date');
+        const workflowEnd=document.getElementById('workflow-end-date');
+        const todayIso=new Date().toISOString().slice(0,10); workflowStart.value=todayIso;
+        function updateWorkflowEnd(){const d=new Date(`${workflowStart.value}T12:00:00`);d.setDate(d.getDate()+Math.max(0,currentDays.length-1));workflowEnd.value=d.toISOString().slice(0,10);}
+        workflowStart.addEventListener('change',updateWorkflowEnd);
+        document.getElementById('route-workflow-form').addEventListener('submit',e=>{if(!currentDays.length||!document.getElementById('route-payload').value){e.preventDefault();alert('Build the route before sending it to Plan Trip.');return;}updateWorkflowEnd();});
+
+        function renderDailyHours(){
+            const count=Math.max(1,Number(document.getElementById('route-days').value)||1),grid=document.getElementById('daily-hours-grid');
+            const old={};grid.querySelectorAll('[data-day-config]').forEach(r=>old[r.dataset.dayConfig]={start:r.querySelector('.day-rep-start').value,end:r.querySelector('.day-rep-end').value});
+            grid.innerHTML=Array.from({length:count},(_,i)=>`<div data-day-config="${i}" class="daily-hours-card"><strong>Day ${i+1}</strong><label>Start<input class="day-rep-start" type="time" value="${old[i]?.start||document.getElementById('rep-start').value}"></label><label>Finish<input class="day-rep-end" type="time" value="${old[i]?.end||document.getElementById('rep-end').value}"></label></div>`).join('');
+            refreshLockDayOptions();
+        }
+        function lockCustomerOptions(){return `<option value="">Choose selected customer</option>${chosenInDisplayOrder().map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}`;}
+        function refreshLockDayOptions(){const count=Math.max(1,Number(document.getElementById('route-days').value)||1);document.querySelectorAll('.lock-day').forEach(sel=>{const v=sel.value;sel.innerHTML=Array.from({length:count},(_,i)=>`<option value="${i+1}">Day ${i+1}</option>`).join('');sel.value=Math.min(Number(v)||1,count);});}
+        function addLockedRow(values={}){const wrap=document.getElementById('locked-appointments'),row=document.createElement('div');row.className='locked-row';row.style.cssText='display:grid;grid-template-columns:2fr 100px 130px 130px auto;gap:8px;align-items:end;margin-bottom:8px;';row.innerHTML=`<label>Customer<select class="lock-customer">${lockCustomerOptions()}</select></label><label>Day<select class="lock-day"></select></label><label>Time<input class="lock-time" type="time" value="${values.time||'10:00'}"></label><label>Type<select class="lock-kind"><option value="locked">Confirmed / locked</option><option value="preferred">Preferred</option></select></label><button type="button" class="danger remove-lock">Remove</button>`;wrap.appendChild(row);refreshLockDayOptions();row.querySelector('.lock-customer').value=values.customerId||'';row.querySelector('.lock-day').value=values.day||1;row.querySelector('.lock-kind').value=values.kind||'locked';row.querySelector('.remove-lock').addEventListener('click',()=>row.remove());}
+        document.getElementById('add-lock').addEventListener('click',()=>addLockedRow());
+        document.getElementById('route-days').addEventListener('change',renderDailyHours);
+        document.getElementById('rep-start').addEventListener('change',renderDailyHours);
+        document.getElementById('rep-end').addEventListener('change',renderDailyHours);
+        renderDailyHours();
+
+        const settingsCustomer=document.getElementById('settings-customer');
+        const settingsDuration=document.getElementById('settings-duration');
+        settingsCustomer.addEventListener('change',()=>{const option=settingsCustomer.options[settingsCustomer.selectedIndex];settingsDuration.value=option?.dataset.duration||45;});
+
+        requestAnimationFrame(() => { map.invalidateSize(true); const allBounds=L.latLngBounds(customers.map(c=>[c.latitude,c.longitude])); if(allBounds.isValid()) map.fitBounds(allBounds.pad(.05)); });
+        window.addEventListener('resize', () => map.invalidateSize(false));
+        [search,group,urgency].forEach(el=>el.addEventListener(el.tagName==='INPUT'?'input':'change',renderMarkers));
+        document.getElementById('fit-visible').addEventListener('click',()=>{const pts=customers.filter(c=>visibleIds.has(Number(c.id))).map(c=>[c.latitude,c.longitude]);if(pts.length)map.fitBounds(pts,{padding:[20,20]});});
+        document.getElementById('select-visible').addEventListener('click',()=>{visibleIds.forEach(id=>{selected.add(id);if(!routeOrder.includes(id))routeOrder.push(id);});clearRouteDisplay();updateSelection();});
+        document.getElementById('clear-selection').addEventListener('click',()=>{selected.clear();routeOrder=[];drawnItems.clearLayers();clearRouteDisplay();updateSelection();});
+        document.getElementById('clear-route').addEventListener('click',()=>{clearRouteDisplay();setStatus('Route lines cleared. Your customer selection is unchanged.');});
+        document.getElementById('optimise-route').addEventListener('click',buildRoute);
+        list.addEventListener('click',e=>{const remove=Number(e.target.dataset.remove),up=Number(e.target.dataset.up),down=Number(e.target.dataset.down);if(remove){selected.delete(remove);routeOrder=routeOrder.filter(x=>x!==remove);clearRouteDisplay();updateSelection();return;}const id=up||down;if(id){const i=routeOrder.indexOf(id),j=up?i-1:i+1;if(i>=0&&j>=0&&j<routeOrder.length){[routeOrder[i],routeOrder[j]]=[routeOrder[j],routeOrder[i]];clearRouteDisplay();updateSelection();setStatus('Manual order updated. Click Optimise & Build Days to recalculate travel times.');}}});
+        document.querySelectorAll('.load-route').forEach(btn=>btn.addEventListener('click',()=>{selected.clear();routeOrder=[];btn.dataset.ids.split(',').filter(Boolean).forEach(x=>{const id=Number(x);selected.add(id);routeOrder.push(id);});clearRouteDisplay();updateSelection();const pts=routeOrder.map(id=>customerById.get(id)).filter(Boolean).map(c=>[c.latitude,c.longitude]);if(pts.length)map.fitBounds(pts,{padding:[30,30]});}));
+        map.on(L.Draw.Event.CREATED,e=>{drawnItems.clearLayers();drawnItems.addLayer(e.layer);const bounds=e.layer.getBounds();customers.forEach(c=>{const id=Number(c.id);if(matches(c)&&bounds.contains([c.latitude,c.longitude])){if(e.layer instanceof L.Polygon){const p=L.latLng(c.latitude,c.longitude),vs=e.layer.getLatLngs()[0];let inside=false;for(let i=0,j=vs.length-1;i<vs.length;j=i++){const xi=vs[i].lng,yi=vs[i].lat,xj=vs[j].lng,yj=vs[j].lat;const hit=((yi>p.lat)!=(yj>p.lat))&&(p.lng<(xj-xi)*(p.lat-yi)/(yj-yi)+xi);if(hit)inside=!inside;}if(inside){selected.add(id);if(!routeOrder.includes(id))routeOrder.push(id);}}else{selected.add(id);if(!routeOrder.includes(id))routeOrder.push(id);}}});clearRouteDisplay();updateSelection();});
+        document.getElementById('save-route-form').addEventListener('submit',e=>{if(!selected.size){e.preventDefault();alert('Select at least one customer before saving.');}});
+    })();
+    </script>
+    {% endif %}
 
     {% if view == 'travel_expenses' %}
     <div class="panel">
@@ -884,43 +2085,70 @@ PAGE = r"""
     {% if view == 'on_the_road' %}
     <div class="panel">
         <div class="heading-row">
-            <div><h2>On the Road</h2><p>A phone-friendly call list for completing visits and capturing quick notes.</p></div>
-            <a class="button-link secondary" href="{{ url_for('trip_prep') }}">Back to Plan Trip</a>
+            <div><h2>On the Road{% if active_trip %} — {{ active_trip.trip_name }}{% endif %}</h2><p>Navigate, track live call times, capture notes and create follow-ups from your phone.</p></div>
+            {% if active_trip %}<a class="button-link secondary" href="{{ url_for('trip_workspace', trip_id=active_trip.id, tab='schedule') }}">Back to Trip Workspace</a>{% else %}<a class="button-link secondary" href="{{ url_for('trip_prep') }}">Back to Plan Trip</a>{% endif %}
         </div>
         {% if success %}<div class="success">{{ success }}</div>{% endif %}
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <div class="road-dashboard">
+            <div class="road-kpi"><div class="label">Calls shown</div><div class="value">{{ road_summary.total }}</div></div>
+            <div class="road-kpi"><div class="label">Completed</div><div class="value">{{ road_summary.completed }}</div></div>
+            <div class="road-kpi"><div class="label">In progress</div><div class="value">{{ road_summary.active }}</div></div>
+            <div class="road-kpi"><div class="label">Remaining</div><div class="value">{{ road_summary.remaining }}</div></div>
+        </div>
         {% if road_rows %}
             {% set ns = namespace(day='') %}
             {% for row in road_rows %}
                 {% if row.date_display != ns.day %}<div class="road-day-heading">{{ row.day_label }}</div>{% set ns.day = row.date_display %}{% endif %}
-                <div class="road-card {% if row.completed %}complete{% endif %}">
-                    <div class="road-time">{{ row.time }}{% if row.completed %} · Visit complete{% endif %}</div>
+                <div class="road-card {% if row.completed %}complete{% elif row.skipped %}skipped{% elif row.started_at %}active{% endif %}">
+                    <div class="road-time">Planned {{ row.time }}{% if row.actual_time_text %} · {{ row.actual_time_text }}{% endif %}</div>
                     <div class="road-store">{{ row.store }}</div>
-                    <div class="mini-tags">
+                    <div class="road-status-line">
+                        <span class="road-status-chip {% if row.completed %}complete{% elif row.skipped %}skipped{% elif row.started_at %}active{% endif %}">{{ row.status_label }}</span>
                         <span class="mini-tag">{{ row.customer_type }}</span>
                         {% if row.open_action_count %}<span class="mini-tag">{{ row.open_action_count }} open action{% if row.open_action_count != 1 %}s{% endif %}</span>{% endif %}
                         {% if row.priority_classification %}<span class="mini-tag">{{ row.priority_classification }}</span>{% endif %}
                     </div>
-                    {% if row.call_note %}<div class="briefing-note"><strong>Portatour note:</strong> {{ row.call_note }}</div>{% endif %}
+                    {% if row.address %}<div class="small" style="margin-top:7px;">{{ row.address }}</div>{% endif %}
+                    {% if row.desired_outcome %}<div class="briefing-note"><strong>Desired outcome:</strong> {{ row.desired_outcome }}</div>{% endif %}
+                    {% if row.preparation_notes %}<div class="briefing-note"><strong>Preparation:</strong> {{ row.preparation_notes }}</div>{% endif %}
+                    {% if row.call_note %}<div class="briefing-note"><strong>Call note:</strong> {{ row.call_note }}</div>{% endif %}
                     {% if row.open_action_titles %}<div class="briefing-note"><strong>Outstanding:</strong> {{ row.open_action_titles|join('; ') }}</div>{% endif %}
-                    <div class="road-actions">
-                        {% if row.customer_exists %}<a class="view-link" href="{{ url_for('customer_detail', store_name=row.store) }}">Customer Brief</a>{% endif %}
-                        <a class="view-link" href="{{ url_for('new_action', store=row.store, source='On the Road') }}">Add Action</a>
+
+                    <div class="road-live-actions">
+                        {% if row.navigation_url %}<a class="button-link" target="_blank" rel="noopener" href="{{ row.navigation_url }}">Navigate</a>{% endif %}
+                        {% if not row.started_at and not row.completed %}<form method="post" action="{{ url_for('road_visit_event') }}"><input type="hidden" name="event" value="start">{{ row.hidden_fields|safe }}<button type="submit">Start Visit</button></form>{% endif %}
+                        {% if not row.completed %}<form method="post" action="{{ url_for('road_visit_event') }}"><input type="hidden" name="event" value="skip">{{ row.hidden_fields|safe }}<button type="submit" class="secondary">{% if row.skipped %}Undo Skip{% else %}Skip Call{% endif %}</button></form>{% endif %}
+                        {% if row.customer_exists %}<a class="button-link secondary" href="{{ url_for('customer_detail', store_name=row.store) }}">Customer Brief</a>{% endif %}
                     </div>
-                    <form class="road-note-form" method="post" action="{{ url_for('update_road_visit') }}">
+
+                    <form class="road-note-form" method="post" enctype="multipart/form-data" action="{{ url_for('update_road_visit') }}">
                         <input type="hidden" name="schedule_id" value="{{ row.schedule_id }}">
                         <input type="hidden" name="visit_date" value="{{ row.date_iso }}">
                         <input type="hidden" name="visit_time" value="{{ row.time }}">
                         <input type="hidden" name="store_name" value="{{ row.store }}">
-                        <label><strong>Quick visit notes</strong></label>
+                        {% if active_trip %}<input type="hidden" name="trip_id" value="{{ active_trip.id }}">{% endif %}
+                        <label><strong>Visit notes</strong></label>
                         <textarea name="visit_notes" placeholder="Key discussion, order agreed, display issue, follow-up needed...">{{ row.visit_notes }}</textarea>
+                        <div class="road-fields">
+                            <label>Outcome<select name="outcome"><option value="">Select outcome</option>{% for option in ['Successful visit','Order / commitment','Follow-up required','No decision','Customer unavailable','Cancelled'] %}<option value="{{ option }}" {% if row.outcome == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+                            <label>Next step<input type="text" name="next_step" value="{{ row.next_step }}" placeholder="What happens next?"></label>
+                            <label>Create follow-up action<input type="text" name="followup_title" placeholder="Optional action title"></label>
+                            <label>Follow-up due<input type="date" name="followup_due"></label>
+                        </div>
+                        <label style="display:block;margin-top:12px;"><strong>Add photo or file</strong><input style="display:block;margin-top:6px;" type="file" name="attachment" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx"></label>
+                        {% if row.attachments %}<div style="margin-top:12px;"><strong>Attachments</strong>{% for file in row.attachments %}<div class="road-attachment"><a href="{{ file.url }}" target="_blank">{{ file.original_name }}</a><span class="small">{{ file.uploaded_display }}</span></div>{% endfor %}</div>{% endif %}
                         <div class="road-note-toolbar">
-                            <label><input type="checkbox" name="completed" value="1" {% if row.completed %}checked{% endif %}> Mark visit complete</label>
-                            <button type="submit">Save Visit</button>
+                            <span class="small">{% if row.actual_duration %}Actual duration: {{ row.actual_duration }} minutes{% else %}Start and finish the visit to track actual duration.{% endif %}</span>
+                            <span style="display:flex;gap:9px;flex-wrap:wrap;justify-content:flex-end;">
+                                <button type="submit" name="action" value="save">Save Visit Details</button>
+                                {% if row.started_at and not row.completed %}<button type="submit" name="action" value="finish">Save &amp; Finish Visit</button>{% endif %}
+                            </span>
                         </div>
                     </form>
                 </div>
             {% endfor %}
-        {% else %}<div class="empty">No upcoming appointments were found. Upload a Portatour schedule in Plan Trip first.</div>{% endif %}
+        {% else %}<div class="empty">No upcoming appointments were found. Send an optimised route to Plan Trip first.</div>{% endif %}
     </div>
     {% endif %}
 
@@ -1024,7 +2252,15 @@ PAGE = r"""
     <div class="panel">
         <div class="heading-row">
             <div><h2>Plan Trip</h2><p>Work through the trip in order, from dates and appointments to packing, travel and final readiness.</p></div>
-            {% if trip_plan.id %}<span class="change-badge {% if readiness.complete %}change-positive{% else %}change-neutral{% endif %}">{{ readiness.done }}/{{ readiness.total }} ready</span>{% endif %}
+            {% if trip_plan.id %}
+            <div class="toolbar">
+                <span class="change-badge {% if readiness.complete %}change-positive{% else %}change-neutral{% endif %}">{{ readiness.done }}/{{ readiness.total }} ready</span>
+                <a class="button-link" href="{{ url_for('trip_workspace', trip_id=trip_plan.id) }}">Open Trip Workspace</a>
+                <form method="post" action="{{ url_for('delete_trip_plan', trip_id=trip_plan.id) }}" onsubmit="return confirm('Delete this planned trip? This will remove the trip and its route-generated schedule, but will not delete customers, actions, customer settings, or general visit history.');">
+                    <button type="submit" class="danger">Delete Trip</button>
+                </form>
+            </div>
+            {% endif %}
         </div>
         <div class="trip-steps">
             <a class="trip-step {% if trip_plan.id %}complete{% else %}current{% endif %}" href="#trip-details">1. Trip details</a>
@@ -1063,7 +2299,24 @@ PAGE = r"""
                     {% if latest_schedule_filename %}<button type="submit" name="action" value="generate" class="secondary">Use Latest Schedule</button>{% endif %}
                 </div>
             </form>
-            {% if appointments %}<div style="margin-top:14px;">{% for item in appointments %}<div class="appointment-mini"><strong>{{ item.store }}</strong><br><span class="small">{{ item.date_display }} · {{ item.time }} · {{ item.customer_type }}</span></div>{% endfor %}</div>{% else %}<div class="empty">No appointments loaded yet.</div>{% endif %}
+            {% if appointments %}
+            <div style="margin-top:14px;display:grid;gap:12px;">
+                {% for item in appointments %}
+                <form method="post" class="appointment-mini" style="padding:14px;border:1px solid #d9e2ec;border-radius:10px;">
+                    <input type="hidden" name="action" value="save_appointment_objective">
+                    <input type="hidden" name="trip_plan_id" value="{{ trip_plan.id or 0 }}">
+                    <input type="hidden" name="appointment_id" value="{{ item.appointment_id }}">
+                    <input type="hidden" name="schedule_id" value="{{ item.schedule_id }}">
+                    <input type="hidden" name="visit_date" value="{{ item.date_iso }}">
+                    <input type="hidden" name="visit_time" value="{{ item.time }}">
+                    <input type="hidden" name="store_name" value="{{ item.store }}">
+                    <div class="heading-row"><div><strong><a class="customer-link" href="{{ url_for('customer_detail', store_name=item.store) }}">{{ item.store }}</a></strong><br><span class="small">{{ item.date_display }} · {{ item.time }} · {{ item.customer_type }}</span></div><button type="submit">Save Objective</button></div>
+                    <label style="display:block;margin-top:10px;font-weight:700;">Desired outcome<textarea class="review-textarea" name="desired_outcome" placeholder="What should this visit achieve?">{{ item.desired_outcome }}</textarea></label>
+                    <label style="display:block;margin-top:10px;font-weight:700;">Preparation notes<textarea class="review-textarea" name="preparation_notes" placeholder="Products, questions, evidence or people to prepare for the call">{{ item.preparation_notes }}</textarea></label>
+                </form>
+                {% endfor %}
+            </div>
+            {% else %}<div class="empty">No appointments loaded yet.</div>{% endif %}
         </div>
     </div>
 
@@ -1130,6 +2383,18 @@ PAGE = r"""
             <div class="customer-stat"><div class="label">Sales value</div><div class="value">{{ customer.sales_display }}</div><div class="small">{{ customer.yoy_display }} year on year</div></div>
             <div class="customer-stat"><div class="label">Open actions</div><div class="value">{{ customer.open_actions }}</div><div class="small">{{ customer.high_actions }} high priority</div></div>
         </div>
+        {% if customer.is_mapped_customer %}
+        <div class="file-details" style="margin-top:18px;">
+            <div class="file-detail"><strong>Address</strong><span>{{ customer.address_display or 'Not supplied' }}</span></div>
+            <div class="file-detail"><strong>Customer group</strong><span>{{ customer.customer_group }}</span></div>
+            <div class="file-detail"><strong>Phone</strong><span>{% if customer.phone %}<a href="tel:{{ customer.phone }}">{{ customer.phone }}</a>{% else %}Not supplied{% endif %}</span></div>
+            <div class="file-detail"><strong>Email</strong><span>{% if customer.email %}<a href="mailto:{{ customer.email }}">{{ customer.email }}</a>{% else %}Not supplied{% endif %}</span></div>
+            <div class="file-detail"><strong>Portatour call note</strong><span>{{ customer.call_note or 'No imported call note' }}</span></div>
+            <div class="file-detail"><strong>Imported planning</strong><span>Tier {{ customer.priority_tier }} · {{ customer.ideal_call_minutes }} min calls · {{ customer.customer_open_time }}–{{ customer.customer_close_time }}</span></div>
+            <div class="file-detail"><strong>Categories</strong><span>{{ customer.categories or 'Not supplied' }}</span></div>
+            <div class="file-detail"><strong>Map coordinates</strong><span>{% if customer.latitude is not none and customer.longitude is not none %}{{ customer.latitude }}, {{ customer.longitude }}{% else %}Not supplied{% endif %}</span></div>
+        </div>
+        {% endif %}
         <div class="button-row" style="text-align:left;">
             <a class="button-link secondary" href="{{ url_for('customer_priorities') }}">Back to Customers</a>
             <a class="button-link" href="{{ url_for('new_action', store=customer.store_name, source='Customer Hub') }}">Add Action</a>
@@ -1170,6 +2435,23 @@ PAGE = r"""
 
         <div>
             <div class="panel">
+                <div class="heading-row"><div><h2>Contacts</h2><p>People associated with this customer.</p></div></div>
+                {% if customer_contacts %}
+                    {% for contact in customer_contacts %}
+                    <div class="customer-action-card"><div class="customer-action-top"><div><h4>{{ contact.contact_name }}</h4><div class="small">{{ contact.role or 'Contact' }}</div></div><form method="post" action="{{ url_for('delete_customer_contact', contact_id=contact.id) }}" onsubmit="return confirm('Delete this contact?');"><input type="hidden" name="store_name" value="{{ customer.store_name }}"><button class="danger" type="submit">Delete</button></form></div>{% if contact.phone %}<div class="small">Phone: <a href="tel:{{ contact.phone }}">{{ contact.phone }}</a></div>{% endif %}{% if contact.email %}<div class="small">Email: <a href="mailto:{{ contact.email }}">{{ contact.email }}</a></div>{% endif %}{% if contact.notes %}<div class="briefing-note">{{ contact.notes }}</div>{% endif %}</div>
+                    {% endfor %}
+                {% else %}<div class="empty">No contacts recorded yet.</div>{% endif %}
+                <form method="post" action="{{ url_for('add_customer_contact') }}" style="margin-top:14px;">
+                    <input type="hidden" name="store_name" value="{{ customer.store_name }}">
+                    <div class="plan-form-grid"><label>Name<input type="text" name="contact_name" required></label><label>Role<input type="text" name="role"></label><label>Phone<input type="text" name="phone"></label><label>Email<input type="email" name="email"></label></div>
+                    <label style="display:block;margin-top:10px;">Notes<textarea class="review-textarea" name="notes"></textarea></label><div class="button-row" style="text-align:left;"><button type="submit">Add Contact</button></div>
+                </form>
+            </div>
+            <div class="panel">
+                <h2>Upcoming Visits</h2>
+                {% if upcoming_customer_visits %}{% for visit in upcoming_customer_visits %}<div class="customer-action-card"><strong>{{ visit.date_display }} · {{ visit.visit_time }}</strong><div class="small">{{ visit.trip_name }}</div>{% if visit.desired_outcome %}<div class="briefing-note"><strong>Desired outcome:</strong> {{ visit.desired_outcome }}</div>{% endif %}</div>{% endfor %}{% else %}<div class="empty">No upcoming planned visits.</div>{% endif %}
+            </div>
+            <div class="panel">
                 <h2>Customer Settings</h2>
                 <form method="post" action="{{ url_for('customer_priorities') }}">
                     <input type="hidden" name="mode" value="save">
@@ -1189,6 +2471,18 @@ PAGE = r"""
                 <div class="file-detail" style="margin-top:10px;"><strong>Current status</strong><span>{{ customer.visit_status }} — {{ customer.visit_detail }}</span></div>
             </div>
         </div>
+    </div>
+    <div class="panel">
+        <div class="heading-row"><div><h2>Call History</h2><p>Completed and recorded visits, newest first.</p></div></div>
+        {% if customer_call_history %}
+            {% for visit in customer_call_history %}
+            <div class="visit-closeout-row">
+                <div><strong>{{ visit.date_display }}</strong><br><span class="small">{{ visit.visit_time }}{% if visit.actual_duration_minutes %} · {{ visit.actual_duration_minutes }} min{% endif %}</span></div>
+                <div><strong>{{ visit.status }}</strong>{% if visit.trip_name %}<div class="small">{{ visit.trip_name }}</div>{% endif %}{% if visit.desired_outcome %}<div class="visit-closeout-note"><strong>Desired outcome:</strong> {{ visit.desired_outcome }}</div>{% endif %}{% if visit.outcome %}<div class="visit-closeout-note"><strong>Outcome:</strong> {{ visit.outcome }}</div>{% endif %}{% if visit.visit_notes %}<div class="visit-closeout-note">{{ visit.visit_notes }}</div>{% endif %}{% if visit.next_step %}<div class="visit-closeout-note"><strong>Next:</strong> {{ visit.next_step }}</div>{% endif %}{% if visit.attachments %}<div class="mini-tags">{% for file in visit.attachments %}<a class="mini-tag" href="{{ file.url }}" target="_blank">{{ file.original_name }}</a>{% endfor %}</div>{% endif %}</div>
+                <div><span class="change-badge {{ visit.badge_class }}">{{ visit.status }}</span></div>
+            </div>
+            {% endfor %}
+        {% else %}<div class="empty">No call history has been recorded yet.</div>{% endif %}
     </div>
     {% endif %}
 
@@ -1234,7 +2528,7 @@ PAGE = r"""
             {% for row in priority_rows %}
             <tr>
                 <td><strong>{{ loop.index }}</strong></td>
-                <td><a class="customer-link" href="{{ url_for('customer_detail', store_name=row.store_name) }}">{{ row.store_name }}</a>{% if row.strategic_notes %}<br><span class="small">{{ row.strategic_notes }}</span>{% endif %}</td>
+                <td><a class="customer-link" href="{{ url_for('customer_detail', store_name=row.store_name) }}">{{ row.store_name }}</a><br><span class="small">{{ row.customer_group }}{% if row.address_display %} · {{ row.address_display }}{% endif %}</span>{% if row.strategic_notes %}<br><span class="small">{{ row.strategic_notes }}</span>{% elif row.call_note %}<br><span class="small">{{ row.call_note }}</span>{% endif %}</td>
                 <td><span class="priority-class priority-{{ row.class_key }}">{{ row.classification }}</span></td>
                 <td><span class="priority-score">{{ row.score }}</span><div class="score-breakdown">{{ row.score_breakdown }}</div></td>
                 <td>
@@ -1928,12 +3222,12 @@ PAGE = r"""
     {% if view == 'follow_up' %}
     <div class="panel">
         <div class="heading-row">
-            <div><h2>After Trip Close-Out</h2><p>Finish the trip in order: confirm visits, bring in notes, create follow-ups, then clear the remaining work.</p></div>
-            <a class="button-link secondary" href="{{ url_for('on_the_road') }}">Review Visit Notes</a>
+            <div><h2>After Trip Close-Out{% if active_trip %} — {{ active_trip.trip_name }}{% endif %}</h2><p>Finish the trip in order: confirm visits, bring in notes, create follow-ups, then clear the remaining work.</p></div>
+            <a class="button-link secondary" href="{{ url_for('on_the_road', trip_id=active_trip_id) if active_trip_id else url_for('on_the_road') }}">Review Visit Notes</a>
         </div>
         <div class="after-trip-progress">
             <div class="after-trip-step {% if after_trip_summary.completed_visits %}done{% else %}attention{% endif %}"><div class="number">1</div><h4>Confirm visits</h4><p>{{ after_trip_summary.completed_visits }} of {{ after_trip_summary.total_visits }} scheduled visits marked complete.</p></div>
-            <div class="after-trip-step {% if after_trip_summary.notes_captured %}done{% else %}attention{% endif %}"><div class="number">2</div><h4>Collect notes</h4><p>{{ after_trip_summary.notes_captured }} completed visits have notes captured.</p></div>
+            <div class="after-trip-step {% if after_trip_summary.notes_captured %}done{% else %}attention{% endif %}"><div class="number">2</div><h4>Collect notes</h4><p>{{ after_trip_summary.notes_captured }} scheduled visits have notes captured.</p></div>
             <div class="after-trip-step {% if parsed_notes or after_trip_summary.actions_today %}done{% else %}{% endif %}"><div class="number">3</div><h4>Create follow-ups</h4><p>Upload the completed Portatour report or load your road notes below.</p></div>
             <div class="after-trip-step {% if after_trip_summary.pending_visits == 0 and after_trip_summary.total_visits > 0 %}done{% endif %}"><div class="number">4</div><h4>Close out</h4><p>{{ after_trip_summary.pending_visits }} scheduled visits still need completion.</p></div>
         </div>
@@ -1947,7 +3241,7 @@ PAGE = r"""
 
     {% if after_trip_visits %}
     <div class="panel">
-        <div class="heading-row"><div><h2>Captured Visit Notes</h2><p>Latest completed calls from the On the Road page.</p></div><a class="button-link" href="{{ url_for('follow_up', load_road_notes=1) }}">Load Road Notes Below</a></div>
+        <div class="heading-row"><div><h2>Captured Visit Notes</h2><p>Calls and notes saved against the selected trip.</p></div><a class="button-link" href="{{ url_for('follow_up', load_road_notes=1, trip_id=active_trip_id) if active_trip_id else url_for('follow_up', load_road_notes=1) }}">Load Road Notes Below</a></div>
         {% for visit in after_trip_visits %}<div class="visit-closeout-row">
             <div><strong>{{ visit.date_display }}</strong><br><span class="small">{{ visit.visit_time }}</span></div>
             <div><strong>{{ visit.store_name }}</strong>{% if visit.visit_notes %}<div class="visit-closeout-note">{{ visit.visit_notes }}</div>{% else %}<div class="small">No notes captured.</div>{% endif %}</div>
@@ -1966,7 +3260,8 @@ PAGE = r"""
         </div>
         {% if success %}<div class="success">{{ success }}</div>{% endif %}
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        <form method="post" action="{{ url_for('follow_up') }}" enctype="multipart/form-data">
+        <form method="post" action="{{ url_for('follow_up', trip_id=active_trip_id) if active_trip_id else url_for('follow_up') }}" enctype="multipart/form-data">
+            {% if active_trip_id %}<input type="hidden" name="trip_id" value="{{ active_trip_id }}">{% endif %}
             <div class="upload-box" style="margin-bottom: 22px;">
                 <h3>Upload a Portatour call report</h3>
                 <p class="small">Upload the HTML report saved from Portatour. The assistant reads the Customer call reports section and pulls out only the dash items under Actions:. Items marked DONE, EMAILED, SENT or COMPLETED are skipped; DNT items remain outstanding.</p>
@@ -1986,6 +3281,7 @@ PAGE = r"""
             <span class="change-badge change-positive">{{ followup_items|length }} suggested</span>
         </div>
         <form method="post" action="{{ url_for('save_followups') }}">
+            {% if active_trip_id %}<input type="hidden" name="trip_id" value="{{ active_trip_id }}">{% endif %}
             <input type="hidden" name="raw_notes" value="{{ raw_notes }}">
             <input type="hidden" name="item_count" value="{{ followup_items|length }}">
             <div class="review-toolbar">
@@ -2714,6 +4010,31 @@ def init_database():
             )
             """
         )
+        road_note_columns = {row[1] for row in connection.execute("PRAGMA table_info(road_visit_notes)").fetchall()}
+        for column_name, column_sql in [
+            ("started_at", "TEXT NOT NULL DEFAULT ''"),
+            ("finished_at", "TEXT NOT NULL DEFAULT ''"),
+            ("actual_duration_minutes", "INTEGER NOT NULL DEFAULT 0"),
+            ("outcome", "TEXT NOT NULL DEFAULT ''"),
+            ("next_step", "TEXT NOT NULL DEFAULT ''"),
+            ("skipped", "INTEGER NOT NULL DEFAULT 0")
+        ]:
+            if column_name not in road_note_columns:
+                connection.execute(f"ALTER TABLE road_visit_notes ADD COLUMN {column_name} {column_sql}")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS road_visit_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL,
+                visit_date TEXT NOT NULL,
+                visit_time TEXT NOT NULL DEFAULT '',
+                store_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS trip_plans (
@@ -2763,6 +4084,88 @@ def init_database():
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointment_objectives (
+                appointment_id TEXT PRIMARY KEY,
+                trip_plan_id INTEGER NOT NULL DEFAULT 0,
+                schedule_id INTEGER NOT NULL DEFAULT 0,
+                visit_date TEXT NOT NULL DEFAULT '',
+                visit_time TEXT NOT NULL DEFAULT '',
+                store_name TEXT NOT NULL DEFAULT '',
+                desired_outcome TEXT NOT NULL DEFAULT '',
+                preparation_notes TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS customer_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store_name TEXT NOT NULL,
+                contact_name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                phone TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS route_customers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT NOT NULL DEFAULT '',
+                portatour_id TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL UNIQUE,
+                street TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', zip TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '',
+                customer_group TEXT NOT NULL DEFAULT 'Other', categories TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '',
+                call_note TEXT NOT NULL DEFAULT '', last_call TEXT NOT NULL DEFAULT '', call_interval INTEGER NOT NULL DEFAULT 42, urgency TEXT NOT NULL DEFAULT '',
+                ideal_call_minutes INTEGER NOT NULL DEFAULT 45,
+                priority_tier TEXT NOT NULL DEFAULT 'C',
+                customer_open_time TEXT NOT NULL DEFAULT '08:00',
+                customer_close_time TEXT NOT NULL DEFAULT '17:00',
+                latitude REAL NOT NULL, longitude REAL NOT NULL, updated_at TEXT NOT NULL
+            )
+            """
+        )
+        trip_schedule_columns = {row[1] for row in connection.execute("PRAGMA table_info(trip_schedules)").fetchall()}
+        if "trip_plan_id" not in trip_schedule_columns:
+            connection.execute("ALTER TABLE trip_schedules ADD COLUMN trip_plan_id INTEGER")
+        trip_plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(trip_plans)").fetchall()}
+        if "completed_at" not in trip_plan_columns:
+            connection.execute("ALTER TABLE trip_plans ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''")
+        if "closeout_notes" not in trip_plan_columns:
+            connection.execute("ALTER TABLE trip_plans ADD COLUMN closeout_notes TEXT NOT NULL DEFAULT ''")
+        route_customer_columns = {row[1] for row in connection.execute("PRAGMA table_info(route_customers)").fetchall()}
+        if "ideal_call_minutes" not in route_customer_columns:
+            connection.execute("ALTER TABLE route_customers ADD COLUMN ideal_call_minutes INTEGER NOT NULL DEFAULT 45")
+        if "priority_tier" not in route_customer_columns:
+            connection.execute("ALTER TABLE route_customers ADD COLUMN priority_tier TEXT NOT NULL DEFAULT 'C'")
+        if "customer_open_time" not in route_customer_columns:
+            connection.execute("ALTER TABLE route_customers ADD COLUMN customer_open_time TEXT NOT NULL DEFAULT '08:00'")
+        if "customer_close_time" not in route_customer_columns:
+            connection.execute("ALTER TABLE route_customers ADD COLUMN customer_close_time TEXT NOT NULL DEFAULT '17:00'")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS route_selections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, start_date TEXT NOT NULL DEFAULT '', end_date TEXT NOT NULL DEFAULT '',
+                customer_ids TEXT NOT NULL, created_at TEXT NOT NULL
+            )
+            """
+        )
+        ensure_reliability_tables(connection)
+        existing_route_customers = connection.execute("SELECT COUNT(*) FROM route_customers").fetchone()[0]
+        if existing_route_customers == 0:
+            for item in json.loads(ROUTE_CUSTOMER_SEED):
+                connection.execute(
+                    """INSERT INTO route_customers (external_id,portatour_id,name,street,city,zip,country,customer_group,categories,phone,email,call_note,last_call,call_interval,urgency,ideal_call_minutes,priority_tier,latitude,longitude,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (item['external_id'],item['portatour_id'],item['name'],item['street'],item['city'],item['zip'],item['country'],item['customer_group'],item['categories'],item['phone'],item['email'],item['call_note'],item['last_call'],item['call_interval'],item['urgency'],45,'C',item['latitude'],item['longitude'],datetime.now().isoformat(timespec='seconds'))
+                )
         connection.commit()
 
 
@@ -4442,27 +5845,53 @@ def mark_existing_action_duplicates(items):
 def follow_up():
     raw_notes = ""
     after_trip_visits = []
+    active_trip = None
+    active_trip_id = request.values.get("trip_id", type=int)
     after_trip_summary = {"total_visits": 0, "completed_visits": 0, "pending_visits": 0, "notes_captured": 0, "actions_today": 0}
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
-        latest_schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
+        if active_trip_id:
+            active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (active_trip_id,)).fetchone()
+            latest_schedule = connection.execute(
+                "SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1",
+                (active_trip_id,),
+            ).fetchone()
+        else:
+            latest_schedule = connection.execute(
+                "SELECT * FROM trip_schedules WHERE trip_plan_id IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest_schedule and latest_schedule["trip_plan_id"]:
+                active_trip_id = int(latest_schedule["trip_plan_id"])
+                active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (active_trip_id,)).fetchone()
+            if latest_schedule is None:
+                latest_schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
+
         if latest_schedule:
-            scheduled = parse_schedule_appointments(latest_schedule["raw_html"], from_date=date.today() - timedelta(days=21))
+            scheduled = parse_schedule_appointments(latest_schedule["raw_html"], from_date=date.min)
             notes = connection.execute(
                 "SELECT * FROM road_visit_notes WHERE schedule_id = ? ORDER BY visit_date DESC, visit_time DESC",
                 (latest_schedule["id"],),
             ).fetchall()
             note_map = {(row["visit_date"], row["visit_time"], row["store_name"].strip().lower()): row for row in notes}
-            relevant = [item for item in scheduled if item["date"] <= date.today()]
+            notes_by_date_store = {}
+            for row in notes:
+                notes_by_date_store.setdefault((row["visit_date"], row["store_name"].strip().lower()), []).append(row)
+            relevant = list(scheduled)
             after_trip_summary["total_visits"] = len(relevant)
             for item in relevant:
-                key = (item["date"].isoformat(), item["time"], item["store"].strip().lower())
+                date_key = item["date"].isoformat()
+                store_key = item["store"].strip().lower()
+                key = (date_key, item["time"], store_key)
                 saved = note_map.get(key)
+                if saved is None:
+                    candidates = notes_by_date_store.get((date_key, store_key), [])
+                    if len(candidates) == 1:
+                        saved = candidates[0]
                 completed = bool(saved["completed"]) if saved else False
                 visit_notes = saved["visit_notes"] if saved else ""
                 if completed:
                     after_trip_summary["completed_visits"] += 1
-                if completed and visit_notes.strip():
+                if visit_notes.strip():
                     after_trip_summary["notes_captured"] += 1
                 after_trip_visits.append({
                     "date_display": item["date"].strftime("%d %b %Y"),
@@ -4470,10 +5899,10 @@ def follow_up():
                     "store_name": item["store"],
                     "visit_notes": visit_notes,
                     "completed": completed,
-                    "date_iso": item["date"].isoformat(),
+                    "date_iso": date_key,
                 })
             after_trip_visits.sort(key=lambda row: (row["date_iso"], row["visit_time"]), reverse=True)
-            after_trip_visits = after_trip_visits[:20]
+            after_trip_visits = after_trip_visits[:50]
         today_prefix = date.today().isoformat()
         after_trip_summary["actions_today"] = connection.execute(
             "SELECT COUNT(*) FROM store_actions WHERE created_at LIKE ?", (today_prefix + "%",)
@@ -4541,12 +5970,14 @@ def follow_up():
         PAGE, view="follow_up", raw_notes=raw_notes, followup_items=items,
         parsed_notes=parsed_notes, error=error, success=success,
         after_trip_summary=after_trip_summary, after_trip_visits=after_trip_visits,
+        active_trip=dict(active_trip) if active_trip else None, active_trip_id=active_trip_id,
         open_action_count=get_open_action_count()
     )
 
 @app.route("/follow-up/save", methods=["POST"])
 def save_followups():
     raw_notes = request.form.get("raw_notes", "")
+    active_trip_id = request.form.get("trip_id", type=int)
     try:
         count = int(request.form.get("item_count", "0"))
     except ValueError:
@@ -4624,7 +6055,7 @@ def save_followups():
             f" {skipped_duplicates} duplicate action"
             f"{'s were' if skipped_duplicates != 1 else ' was'} skipped."
         )
-    return redirect(url_for("follow_up", success=message))
+    return redirect(url_for("follow_up", success=message, trip_id=active_trip_id) if active_trip_id else url_for("follow_up", success=message))
 
 
 ACTION_STATUSES = ["Open", "In Progress", "Waiting on Store", "Completed"]
@@ -4984,12 +6415,13 @@ def trip_prep():
 
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
-        latest_schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
         requested_id = request.args.get("trip", type=int)
         if requested_id:
             trip_plan = connection.execute("SELECT * FROM trip_plans WHERE id=?", (requested_id,)).fetchone()
+            latest_schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (requested_id,)).fetchone()
         else:
             trip_plan = connection.execute("SELECT * FROM trip_plans ORDER BY start_date DESC, id DESC LIMIT 1").fetchone()
+            latest_schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
 
     if request.method == "POST":
         action = request.form.get("action", "generate")
@@ -5015,6 +6447,19 @@ def trip_prep():
                         plan_id=cur.lastrowid
                     connection.commit()
                 return redirect(url_for("trip_prep", trip=plan_id, success="Trip details saved."))
+
+        elif action == "save_appointment_objective":
+            plan_id=request.form.get("trip_plan_id",type=int) or 0
+            appointment_id=request.form.get("appointment_id","").strip()
+            if not appointment_id:
+                error="The appointment could not be identified."
+            else:
+                with sqlite3.connect(DATABASE_PATH) as connection:
+                    connection.execute("""INSERT INTO appointment_objectives (appointment_id,trip_plan_id,schedule_id,visit_date,visit_time,store_name,desired_outcome,preparation_notes,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(appointment_id) DO UPDATE SET desired_outcome=excluded.desired_outcome,preparation_notes=excluded.preparation_notes,store_name=excluded.store_name,visit_date=excluded.visit_date,visit_time=excluded.visit_time,updated_at=excluded.updated_at""",
+                    (appointment_id,plan_id,request.form.get("schedule_id",type=int) or 0,request.form.get("visit_date",""),request.form.get("visit_time",""),request.form.get("store_name","").strip(),request.form.get("desired_outcome","").strip(),request.form.get("preparation_notes","").strip(),now))
+                    connection.commit()
+                return redirect(url_for("trip_prep",trip=plan_id,success="Appointment objective saved.")+"#appointments")
 
         elif action == "save_trip_travel":
             plan_id=request.form.get("trip_plan_id", type=int)
@@ -5057,8 +6502,15 @@ def trip_prep():
 
     if latest_schedule is not None:
         raw_appointments=parse_schedule_appointments(latest_schedule["raw_html"], today)
+        objective_map={}
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            connection.row_factory=sqlite3.Row
+            for row in connection.execute("SELECT * FROM appointment_objectives WHERE schedule_id=?",(latest_schedule["id"],)).fetchall(): objective_map[row["appointment_id"]]=dict(row)
+        plan_for_id=(trip_plan["id"] if trip_plan else 0)
         for appt in raw_appointments:
-            appointments.append({**appt,"date_display":f"{appt['date'].day} {appt['date'].strftime('%b %Y')}","customer_type":classify_customer(appt["store"])})
+            appt_id=appointment_uid(plan_for_id,latest_schedule["id"],appt['date'].isoformat(),appt['time'],appt['store'])
+            obj=objective_map.get(appt_id,{})
+            appointments.append({**appt,"date_display":f"{appt['date'].day} {appt['date'].strftime('%b %Y')}","date_iso":appt['date'].isoformat(),"customer_type":classify_customer(appt["store"]),"appointment_id":appt_id,"schedule_id":latest_schedule["id"],"desired_outcome":obj.get("desired_outcome",''),"preparation_notes":obj.get("preparation_notes",'')})
         if should_generate or appointments:
             for index, appointment in enumerate(raw_appointments):
                 quantities=default_brochure_quantities(appointment["store"])
@@ -5125,6 +6577,7 @@ def build_customer_priority_rows():
         manual_rows = {r["store_name"].strip().lower(): dict(r) for r in connection.execute("SELECT * FROM customer_priorities").fetchall()}
         analyses = connection.execute("SELECT store_name, analysis_json FROM opportunity_analyses").fetchall()
         actions = connection.execute("SELECT store_name, priority, status FROM store_actions WHERE status != 'Completed'").fetchall()
+        mapped_rows = {r["name"].strip().lower(): dict(r) for r in connection.execute("SELECT * FROM route_customers").fetchall() if r["name"]}
 
     stores = {}
     for record in analyses:
@@ -5144,10 +6597,16 @@ def build_customer_priority_rows():
         stores[key]["actions"].append(dict(action))
     for key, manual in manual_rows.items():
         stores.setdefault(key, {"store_name": manual["store_name"], "analysis": None, "actions": []})
+    # Every Portatour/map customer is a real customer account.  Include it in
+    # the Customers tab even when it has no opportunity analysis or action yet.
+    for key, mapped in mapped_rows.items():
+        stores.setdefault(key, {"store_name": mapped["name"], "analysis": None, "actions": []})
+        stores[key]["mapped"] = mapped
 
     rows = []
     for key, entry in stores.items():
         manual = manual_rows.get(key, {})
+        mapped = entry.get("mapped") or mapped_rows.get(key, {})
         analysis = entry.get("analysis") or {}
         auto_sales = parse_currency_value(analysis.get("total_sales_ty", 0))
         manual_sales = float(manual.get("manual_sales_value", 0) or 0)
@@ -5156,9 +6615,10 @@ def build_customer_priority_rows():
         opportunity = parse_currency_value(analysis.get("total_opp_gap", 0))
         urgent = int(analysis.get("urgent_stock_count", 0) or 0)
         core = int(analysis.get("core_gap_count", 0) or 0)
-        growth_potential = max(1, min(5, int(manual.get("growth_potential", 3) or 3)))
-        frequency = max(1, int(manual.get("visit_frequency_days", 42) or 42))
-        last_visit_text = str(manual.get("last_visit_date", "") or "")
+        tier_growth = {"A": 5, "B": 4, "C": 3, "D": 2}
+        growth_potential = max(1, min(5, int(manual.get("growth_potential", tier_growth.get(str(mapped.get("priority_tier", "C") or "C").upper(), 3)) or 3)))
+        frequency = max(1, int(manual.get("visit_frequency_days", mapped.get("call_interval", 42)) or 42))
+        last_visit_text = str(manual.get("last_visit_date", mapped.get("last_call", "")) or "")
         open_actions = len(entry["actions"])
         high_actions = sum(1 for a in entry["actions"] if a.get("priority") == "High")
 
@@ -5211,6 +6671,19 @@ def build_customer_priority_rows():
             "growth_potential": growth_potential, "visit_frequency_days": frequency, "last_visit_date": last_visit_text,
             "manual_sales_value": f"{manual_sales:.2f}", "strategic_notes": str(manual.get("strategic_notes", "") or ""),
             "score_breakdown": breakdown,
+            "customer_group": str(mapped.get("customer_group", "") or classify_customer(entry["store_name"])),
+            "street": str(mapped.get("street", "") or ""), "city": str(mapped.get("city", "") or ""),
+            "zip": str(mapped.get("zip", "") or ""), "country": str(mapped.get("country", "") or ""),
+            "address_display": ", ".join(str(v).strip() for v in [mapped.get("street", ""), mapped.get("city", ""), mapped.get("zip", "")] if v and str(v).strip()),
+            "phone": str(mapped.get("phone", "") or ""), "email": str(mapped.get("email", "") or ""),
+            "call_note": str(mapped.get("call_note", "") or ""), "categories": str(mapped.get("categories", "") or ""),
+            "urgency": str(mapped.get("urgency", "") or ""), "priority_tier": str(mapped.get("priority_tier", "C") or "C"),
+            "ideal_call_minutes": int(mapped.get("ideal_call_minutes", 45) or 45),
+            "customer_open_time": str(mapped.get("customer_open_time", "08:00") or "08:00"),
+            "customer_close_time": str(mapped.get("customer_close_time", "17:00") or "17:00"),
+            "latitude": mapped.get("latitude"), "longitude": mapped.get("longitude"),
+            "external_id": str(mapped.get("external_id", "") or ""), "portatour_id": str(mapped.get("portatour_id", "") or ""),
+            "is_mapped_customer": bool(mapped),
         })
     return sorted(rows, key=lambda r: (-r["score"], r["store_name"].lower()))
 
@@ -5276,104 +6749,281 @@ def customer_detail(store_name):
             analysis_id = analysis_record["id"]
         except json.JSONDecodeError:
             analysis = None
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        contacts=[dict(r) for r in connection.execute("SELECT * FROM customer_contacts WHERE lower(trim(store_name))=lower(trim(?)) ORDER BY contact_name COLLATE NOCASE",(store_name,)).fetchall()]
+        history_rows=connection.execute("""SELECT n.*,s.trip_plan_id,p.trip_name,o.desired_outcome FROM road_visit_notes n LEFT JOIN trip_schedules s ON s.id=n.schedule_id LEFT JOIN trip_plans p ON p.id=s.trip_plan_id LEFT JOIN appointment_objectives o ON o.appointment_id=n.appointment_id WHERE lower(trim(n.store_name))=lower(trim(?)) ORDER BY n.visit_date DESC,n.visit_time DESC""",(store_name,)).fetchall()
+        attachments=connection.execute("SELECT * FROM road_visit_attachments WHERE lower(trim(store_name))=lower(trim(?)) ORDER BY uploaded_at DESC",(store_name,)).fetchall()
+        att_map={}
+        for a in attachments: att_map.setdefault(a['appointment_id'] or (a['visit_date'],a['visit_time']),[]).append({'original_name':a['original_name'],'url':url_for('road_attachment',attachment_id=a['id'])})
+        upcoming=connection.execute("""SELECT o.*,p.trip_name FROM appointment_objectives o LEFT JOIN trip_plans p ON p.id=o.trip_plan_id WHERE lower(trim(o.store_name))=lower(trim(?)) AND o.visit_date>=? ORDER BY o.visit_date,o.visit_time""",(store_name,date.today().isoformat())).fetchall()
+    customer_call_history=[]
+    for r in history_rows:
+        status='Completed' if r['completed'] else ('Skipped' if r['skipped'] else 'Recorded')
+        customer_call_history.append({**dict(r),'date_display':datetime.strptime(r['visit_date'],'%Y-%m-%d').strftime('%d %b %Y') if r['visit_date'] else '', 'status':status,'badge_class':'change-positive' if status=='Completed' else ('change-negative' if status=='Skipped' else 'change-neutral'),'attachments':att_map.get(r['appointment_id'] or (r['visit_date'],r['visit_time']),[])})
+    upcoming_customer_visits=[{**dict(r),'date_display':datetime.strptime(r['visit_date'],'%Y-%m-%d').strftime('%d %b %Y') if r['visit_date'] else ''} for r in upcoming]
     return render_template_string(
         PAGE, view="customer_detail", customer=customer, customer_actions=customer_actions,
         analysis=analysis, analysis_id=analysis_id, open_action_count=get_open_action_count(),
+        customer_contacts=contacts, customer_call_history=customer_call_history, upcoming_customer_visits=upcoming_customer_visits,
     )
+
+@app.route("/customer-contact/add",methods=["POST"])
+def add_customer_contact():
+    store=request.form.get("store_name","").strip(); name=request.form.get("contact_name","").strip(); now=datetime.now().isoformat(timespec="seconds")
+    if store and name:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            connection.execute("INSERT INTO customer_contacts (store_name,contact_name,role,phone,email,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",(store,name,request.form.get("role","").strip(),request.form.get("phone","").strip(),request.form.get("email","").strip(),request.form.get("notes","").strip(),now,now)); connection.commit()
+    return redirect(url_for("customer_detail",store_name=store))
+
+@app.route("/customer-contact/<int:contact_id>/delete",methods=["POST"])
+def delete_customer_contact(contact_id):
+    store=request.form.get("store_name","").strip()
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute("DELETE FROM customer_contacts WHERE id=?",(contact_id,)); connection.commit()
+    return redirect(url_for("customer_detail",store_name=store))
 
 @app.route("/on-the-road")
 def on_the_road():
+    from urllib.parse import quote_plus
     road_rows = []
+    requested_trip_id = request.args.get("trip_id", type=int) or get_active_trip_id()
+    if requested_trip_id:
+        set_active_trip(requested_trip_id)
+    active_trip = None
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.row_factory = sqlite3.Row
-        schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
+        if requested_trip_id:
+            active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (requested_trip_id,)).fetchone()
+            schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (requested_trip_id,)).fetchone()
+        else:
+            schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
+            if schedule and schedule["trip_plan_id"]:
+                active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (schedule["trip_plan_id"],)).fetchone()
         actions = connection.execute("SELECT store_name, title FROM store_actions WHERE status != 'Completed'").fetchall()
         customers = {row[0].strip().lower() for row in connection.execute(
             "SELECT store_name FROM customer_priorities UNION SELECT store_name FROM opportunity_analyses UNION SELECT DISTINCT store_name FROM store_actions"
         ).fetchall() if row[0]}
+        route_customers = {row["name"].strip().lower(): row for row in connection.execute("SELECT * FROM route_customers").fetchall()}
         priority_rows = build_customer_priority_rows()
         priority_map = {row["store_name"].strip().lower(): row for row in priority_rows}
-        saved_notes = {}
+        saved_notes, attachment_map = {}, {}
+        objective_map={}
         if schedule:
+            for obj in connection.execute("SELECT * FROM appointment_objectives WHERE schedule_id=?",(schedule["id"],)).fetchall(): objective_map[obj["appointment_id"]]=dict(obj)
             for note in connection.execute("SELECT * FROM road_visit_notes WHERE schedule_id = ?", (schedule["id"],)).fetchall():
                 key = (note["visit_date"], note["visit_time"], note["store_name"].strip().lower())
                 saved_notes[key] = note
+            for attachment in connection.execute("SELECT * FROM road_visit_attachments WHERE schedule_id=? ORDER BY uploaded_at DESC", (schedule["id"],)).fetchall():
+                key = (attachment["visit_date"], attachment["visit_time"], attachment["store_name"].strip().lower())
+                attachment_map.setdefault(key, []).append(attachment)
     action_map = {}
     for action in actions:
         action_map.setdefault(action["store_name"].strip().lower(), []).append(action["title"])
     if schedule:
-        appointments = parse_schedule_appointments(schedule["raw_html"], from_date=date.today())[:30]
+        appointments = parse_schedule_appointments(schedule["raw_html"], from_date=date.min if active_trip else date.today())[:100]
         for item in appointments:
             store_key = item["store"].strip().lower()
             titles = action_map.get(store_key, [])
             note_key = (item["date"].isoformat(), item["time"], store_key)
             saved = saved_notes.get(note_key)
             priority = priority_map.get(store_key, {})
+            mapped = route_customers.get(store_key)
             day_label = item["date"].strftime("%A, %d %B %Y")
-            if item["date"] == date.today():
-                day_label = "Today - " + day_label
-            elif item["date"] == date.today() + timedelta(days=1):
-                day_label = "Tomorrow - " + day_label
+            if item["date"] == date.today(): day_label = "Today - " + day_label
+            elif item["date"] == date.today() + timedelta(days=1): day_label = "Tomorrow - " + day_label
+            address_parts = []
+            if mapped:
+                address_parts = [mapped["street"], mapped["city"], mapped["zip"]]
+            address = ", ".join(str(v).strip() for v in address_parts if v and str(v).strip())
+            destination = address or item["store"]
+            navigation_url = "https://www.google.com/maps/dir/?api=1&destination=" + quote_plus(destination)
+            started = saved["started_at"] if saved and "started_at" in saved.keys() else ""
+            finished = saved["finished_at"] if saved and "finished_at" in saved.keys() else ""
+            completed = bool(saved["completed"]) if saved else False
+            skipped = bool(saved["skipped"]) if saved and "skipped" in saved.keys() else False
+            if completed: status_label = "Completed"
+            elif skipped: status_label = "Skipped"
+            elif started: status_label = "In progress"
+            else: status_label = "Planned"
+            actual_time_text = ""
+            if started:
+                try: actual_time_text = "started " + datetime.fromisoformat(started).strftime("%H:%M")
+                except ValueError: pass
+            if finished:
+                try: actual_time_text += (" · " if actual_time_text else "") + "finished " + datetime.fromisoformat(finished).strftime("%H:%M")
+                except ValueError: pass
+            appt_id = appointment_uid(active_trip["id"] if active_trip else schedule["trip_plan_id"], schedule["id"], item["date"].isoformat(), item["time"], item["store"])
+            with sqlite3.connect(DATABASE_PATH) as appt_connection:
+                appt_connection.execute("INSERT INTO trip_appointments (appointment_id,trip_id,schedule_id,visit_date,visit_time,store_name,sequence_no,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(appointment_id) DO UPDATE SET visit_date=excluded.visit_date,visit_time=excluded.visit_time,store_name=excluded.store_name,sequence_no=excluded.sequence_no,updated_at=excluded.updated_at",
+                    (appt_id, active_trip["id"] if active_trip else (schedule["trip_plan_id"] or 0), schedule["id"], item["date"].isoformat(), item["time"], item["store"], len(road_rows)+1, datetime.now().isoformat(timespec="seconds")))
+                appt_connection.commit()
+            hidden_fields = ''.join([
+                f'<input type="hidden" name="appointment_id" value="{appt_id}">',
+                f'<input type="hidden" name="schedule_id" value="{schedule["id"]}">',
+                f'<input type="hidden" name="visit_date" value="{item["date"].isoformat()}">',
+                f'<input type="hidden" name="visit_time" value="{item["time"]}">',
+                f'<input type="hidden" name="store_name" value="{item["store"]}">',
+                f'<input type="hidden" name="trip_id" value="{active_trip["id"] if active_trip else ""}">'
+            ])
+            attachments=[]
+            for attachment in attachment_map.get(note_key, []):
+                try: uploaded_display=datetime.fromisoformat(attachment["uploaded_at"]).strftime("%d %b %Y %H:%M")
+                except ValueError: uploaded_display=attachment["uploaded_at"]
+                attachments.append({"original_name":attachment["original_name"],"uploaded_display":uploaded_display,"url":url_for("road_attachment", attachment_id=attachment["id"])})
+            objective=objective_map.get(appt_id,{})
             road_rows.append({
-                "schedule_id": schedule["id"],
-                "store": item["store"],
-                "date_iso": item["date"].isoformat(),
-                "date_display": item["date"].strftime("%d %b %Y"),
-                "day_label": day_label,
-                "time": item["time"],
-                "call_note": item["call_note"],
-                "customer_type": classify_customer(item["store"]),
-                "customer_exists": store_key in customers,
-                "priority_classification": priority.get("classification", ""),
-                "open_action_count": len(titles),
-                "open_action_titles": titles[:4],
-                "visit_notes": saved["visit_notes"] if saved else "",
-                "completed": bool(saved["completed"]) if saved else False,
+                "schedule_id": schedule["id"], "store": item["store"], "date_iso": item["date"].isoformat(),
+                "date_display": item["date"].strftime("%d %b %Y"), "day_label": day_label, "time": item["time"],
+                "call_note": item["call_note"], "desired_outcome": objective.get("desired_outcome",""), "preparation_notes": objective.get("preparation_notes",""), "customer_type": mapped["customer_group"] if mapped else classify_customer(item["store"]),
+                "customer_exists": store_key in customers or bool(mapped), "priority_classification": priority.get("classification", mapped["priority_tier"] if mapped else ""),
+                "open_action_count": len(titles), "open_action_titles": titles[:4], "visit_notes": saved["visit_notes"] if saved else "",
+                "completed": completed, "started_at": started, "finished_at": finished, "skipped": skipped, "status_label": status_label,
+                "actual_duration": saved["actual_duration_minutes"] if saved and "actual_duration_minutes" in saved.keys() else 0,
+                "outcome": saved["outcome"] if saved and "outcome" in saved.keys() else "", "next_step": saved["next_step"] if saved and "next_step" in saved.keys() else "",
+                "actual_time_text": actual_time_text, "address": address, "navigation_url": navigation_url, "hidden_fields": hidden_fields,
+                "attachments": attachments
             })
-    return render_template_string(
-        PAGE, view="on_the_road", road_rows=road_rows,
-        success=request.args.get("success"), open_action_count=get_open_action_count(),
-    )
+    summary={"total":len(road_rows),"completed":sum(1 for r in road_rows if r["completed"]),"active":sum(1 for r in road_rows if r["started_at"] and not r["completed"]),"remaining":sum(1 for r in road_rows if not r["completed"] and not r["skipped"])}
+    return render_template_string(PAGE, view="on_the_road", road_rows=road_rows, road_summary=summary,
+        active_trip=dict(active_trip) if active_trip else None, success=request.args.get("success"),
+        error=request.args.get("error"), open_action_count=get_open_action_count())
+
+
+def _road_visit_key_from_form():
+    try: schedule_id=int(request.form.get("schedule_id","0"))
+    except ValueError: schedule_id=0
+    return schedule_id, request.form.get("visit_date","").strip(), request.form.get("visit_time","").strip(), request.form.get("store_name","").strip(), request.form.get("appointment_id","").strip()
+
+
+def _road_redirect(message=None, error=None):
+    kwargs = {}
+    trip_id = request.form.get("trip_id", type=int) or request.args.get("trip_id", type=int)
+    if trip_id:
+        kwargs["trip_id"] = trip_id
+    if message:
+        kwargs["success"] = message
+    if error:
+        kwargs["error"] = error
+    return redirect(url_for("on_the_road", **kwargs))
+
+
+def _ensure_road_note(connection, schedule_id, visit_date, visit_time, store_name, appt_id=""):
+    now=datetime.now().isoformat(timespec="seconds")
+    connection.execute("""INSERT INTO road_visit_notes (schedule_id,visit_date,visit_time,store_name,visit_notes,completed,updated_at,appointment_id)
+        VALUES (?,?,?,?,?,0,?,?) ON CONFLICT(schedule_id,visit_date,visit_time,store_name) DO UPDATE SET appointment_id=CASE WHEN excluded.appointment_id!='' THEN excluded.appointment_id ELSE road_visit_notes.appointment_id END""",
+        (schedule_id,visit_date,visit_time,store_name,"",now,appt_id))
+
+
+@app.route("/on-the-road/event", methods=["POST"])
+def road_visit_event():
+    schedule_id, visit_date, visit_time, store_name, appt_id = _road_visit_key_from_form()
+    event=request.form.get("event","")
+    if not schedule_id or not visit_date or not store_name: return _road_redirect(error="Visit details were incomplete.")
+    now=datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        _ensure_road_note(connection,schedule_id,visit_date,visit_time,store_name,appt_id)
+        row=connection.execute("SELECT * FROM road_visit_notes WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",(schedule_id,visit_date,visit_time,store_name)).fetchone()
+        if event=="start":
+            connection.execute("UPDATE road_visit_notes SET started_at=?,finished_at='',actual_duration_minutes=0,completed=0,skipped=0,updated_at=? WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",(now,now,schedule_id,visit_date,visit_time,store_name))
+            message=f"Started visit at {store_name}."
+        elif event=="finish":
+            started=row["started_at"] or now
+            try: duration=max(1,round((datetime.fromisoformat(now)-datetime.fromisoformat(started)).total_seconds()/60))
+            except ValueError: duration=0
+            connection.execute("UPDATE road_visit_notes SET finished_at=?,actual_duration_minutes=?,completed=1,skipped=0,updated_at=? WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",(now,duration,now,schedule_id,visit_date,visit_time,store_name))
+            connection.execute("""INSERT INTO customer_priorities (store_name,growth_potential,visit_frequency_days,last_visit_date,manual_sales_value,strategic_notes,updated_at)
+                VALUES (?,3,42,?,0,'',?) ON CONFLICT(store_name) DO UPDATE SET last_visit_date=excluded.last_visit_date,updated_at=excluded.updated_at""",(store_name,visit_date,now))
+            message=f"Finished {store_name} visit ({duration} minutes)."
+        elif event=="skip":
+            new_value=0 if row["skipped"] else 1
+            connection.execute("UPDATE road_visit_notes SET skipped=?,completed=0,updated_at=? WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",(new_value,now,schedule_id,visit_date,visit_time,store_name))
+            message=("Skipped " if new_value else "Restored ")+store_name+"."
+        else: message="No visit change was made."
+        connection.commit()
+    return _road_redirect(message=message)
 
 
 @app.route("/on-the-road/update", methods=["POST"])
 def update_road_visit():
-    try:
-        schedule_id = int(request.form.get("schedule_id", "0"))
-    except ValueError:
-        schedule_id = 0
-    visit_date = request.form.get("visit_date", "").strip()
-    visit_time = request.form.get("visit_time", "").strip()
-    store_name = request.form.get("store_name", "").strip()
-    visit_notes = request.form.get("visit_notes", "").strip()
-    completed = 1 if request.form.get("completed") == "1" else 0
+    schedule_id, visit_date, visit_time, store_name, appt_id = _road_visit_key_from_form()
     if not schedule_id or not visit_date or not store_name:
-        return redirect(url_for("on_the_road"))
+        return _road_redirect(error="Visit details were incomplete.")
+    form_action = request.form.get("action", "save").strip().lower()
+    visit_notes = request.form.get("visit_notes", "").strip()
+    outcome = request.form.get("outcome", "").strip()
+    next_step = request.form.get("next_step", "").strip()
+    followup_title = request.form.get("followup_title", "").strip()
+    followup_due = request.form.get("followup_due", "").strip()
     now = datetime.now().isoformat(timespec="seconds")
+    duration = 0
     with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        _ensure_road_note(connection, schedule_id, visit_date, visit_time, store_name, appt_id)
+        row = connection.execute(
+            "SELECT * FROM road_visit_notes WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",
+            (schedule_id, visit_date, visit_time, store_name),
+        ).fetchone()
         connection.execute(
-            """
-            INSERT INTO road_visit_notes (schedule_id, visit_date, visit_time, store_name, visit_notes, completed, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(schedule_id, visit_date, visit_time, store_name) DO UPDATE SET
-                visit_notes=excluded.visit_notes,
-                completed=excluded.completed,
-                updated_at=excluded.updated_at
-            """,
-            (schedule_id, visit_date, visit_time, store_name, visit_notes, completed, now),
+            "UPDATE road_visit_notes SET visit_notes=?,outcome=?,next_step=?,updated_at=? WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",
+            (visit_notes, outcome, next_step, now, schedule_id, visit_date, visit_time, store_name),
         )
-        if completed:
+        if followup_title:
+            existing = connection.execute(
+                "SELECT id FROM store_actions WHERE lower(trim(store_name))=lower(trim(?)) AND lower(trim(title))=lower(trim(?)) AND status!='Completed' LIMIT 1",
+                (store_name, followup_title),
+            ).fetchone()
+            if not existing:
+                connection.execute(
+                    "INSERT INTO store_actions (store_name,title,detail,priority,status,due_date,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (store_name, followup_title, next_step or visit_notes, "Medium", "Open", followup_due, "On the Road", now, now),
+                )
+        attachment = request.files.get("attachment")
+        if attachment and attachment.filename:
+            ext = Path(attachment.filename).suffix.lower()[:10]
+            stored_name = f"{uuid.uuid4().hex}{ext}"
+            attachment_dir = DATA_DIR / "road_visit_files"
+            attachment_dir.mkdir(parents=True, exist_ok=True)
+            attachment.save(attachment_dir / stored_name)
             connection.execute(
-                """
-                INSERT INTO customer_priorities (store_name, growth_potential, visit_frequency_days, last_visit_date, manual_sales_value, strategic_notes, updated_at)
-                VALUES (?, 3, 42, ?, 0, '', ?)
-                ON CONFLICT(store_name) DO UPDATE SET last_visit_date=excluded.last_visit_date, updated_at=excluded.updated_at
-                """,
+                "INSERT INTO road_visit_attachments (schedule_id,visit_date,visit_time,store_name,stored_name,original_name,uploaded_at,appointment_id) VALUES (?,?,?,?,?,?,?,?)",
+                (schedule_id, visit_date, visit_time, store_name, stored_name, Path(attachment.filename).name, now, appt_id),
+            )
+        if form_action == "finish":
+            started = row["started_at"] or now
+            try:
+                duration = max(1, round((datetime.fromisoformat(now) - datetime.fromisoformat(started)).total_seconds() / 60))
+            except (ValueError, TypeError):
+                duration = 0
+            connection.execute(
+                "UPDATE road_visit_notes SET started_at=?,finished_at=?,actual_duration_minutes=?,completed=1,skipped=0,updated_at=? WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",
+                (started, now, duration, now, schedule_id, visit_date, visit_time, store_name),
+            )
+            connection.execute(
+                """INSERT INTO customer_priorities (store_name,growth_potential,visit_frequency_days,last_visit_date,manual_sales_value,strategic_notes,updated_at)
+                VALUES (?,3,42,?,0,'',?) ON CONFLICT(store_name) DO UPDATE SET last_visit_date=excluded.last_visit_date,updated_at=excluded.updated_at""",
                 (store_name, visit_date, now),
             )
         connection.commit()
-    message = f"{store_name} visit saved" + (" and marked complete." if completed else ".")
-    return redirect(url_for("on_the_road", success=message))
+    audit_event("visit_" + ("completed" if form_action == "finish" else "saved"), store_name, request.form.get("trip_id", type=int), appt_id)
+    if form_action == "finish":
+        message = f"Saved and completed {store_name} ({duration} minutes)."
+    else:
+        message = f"Saved visit details for {store_name}."
+    if followup_title:
+        message += " Follow-up action saved."
+    return _road_redirect(message=message)
+
+
+@app.route("/on-the-road/attachment/<int:attachment_id>")
+def road_attachment(attachment_id):
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        row=connection.execute("SELECT * FROM road_visit_attachments WHERE id=?",(attachment_id,)).fetchone()
+    if not row: return "Attachment not found",404
+    folder=DATA_DIR/"road_visit_files"
+    return send_from_directory(folder,row["stored_name"],as_attachment=False,download_name=row["original_name"])
 
 
 @app.route("/control-centre")
@@ -5687,6 +7337,544 @@ def update_action(action_id):
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.execute("UPDATE store_actions SET status=?, updated_at=? WHERE id=?",(status,datetime.now().isoformat(timespec="seconds"),action_id)); connection.commit()
     return redirect(request.referrer or url_for("actions"))
+
+
+
+def infer_customer_group(name):
+    value = str(name or '').lower()
+    checks = [('bunnings','Bunnings'),('mitre 10 mega','Mitre 10 Mega'),('mitre10 mega','Mitre 10 Mega'),('mitre 10','Mitre 10'),('mitre10','Mitre 10'),('placemakers','Placemakers'),('place makers','Placemakers'),('carters','Carters'),('itm','ITM'),('hammer hardware','Hammer Hardware'),('buildlink','Buildlink')]
+    for needle, label in checks:
+        if needle in value: return label
+    return 'Other'
+
+def import_portatour_customers(uploaded_file):
+    frame = pd.read_excel(uploaded_file, sheet_name='Data')
+    required = {'Name','Latitude','Longitude'}
+    if not required.issubset(frame.columns):
+        raise ValueError('The workbook must contain a Data sheet with Name, Latitude and Longitude columns.')
+    frame = frame.dropna(subset=['Name','Latitude','Longitude'])
+    now = datetime.now().isoformat(timespec='seconds')
+    imported = 0
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        for _, row in frame.iterrows():
+            def clean(field, default=''):
+                value = row.get(field, default)
+                if pd.isna(value): return default
+                if isinstance(value, (pd.Timestamp, datetime)): return value.date().isoformat()
+                return str(value).strip()
+            name = clean('Name')
+            try: latitude=float(row.get('Latitude')); longitude=float(row.get('Longitude'))
+            except (TypeError,ValueError): continue
+            external_id=clean('External ID') or clean('Customer #'); portatour_id=clean('Portatour ID')
+            try: interval=max(1,int(float(row.get('Call interval',42) or 42)))
+            except (TypeError,ValueError): interval=42
+            values=(external_id,portatour_id,name,clean('Street'),clean('City'),clean('ZIP'),clean('Country','New Zealand'),infer_customer_group(name),clean('Categories'),clean('Phone'),clean('Store Email'),clean('Call Note'),clean('Last call'),interval,clean('Current urgency name').lower(),latitude,longitude,now)
+            connection.execute("""INSERT INTO route_customers (external_id,portatour_id,name,street,city,zip,country,customer_group,categories,phone,email,call_note,last_call,call_interval,urgency,latitude,longitude,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET external_id=excluded.external_id,portatour_id=excluded.portatour_id,street=excluded.street,city=excluded.city,zip=excluded.zip,country=excluded.country,customer_group=excluded.customer_group,categories=excluded.categories,phone=excluded.phone,email=excluded.email,call_note=excluded.call_note,last_call=excluded.last_call,call_interval=excluded.call_interval,urgency=excluded.urgency,latitude=excluded.latitude,longitude=excluded.longitude,updated_at=excluded.updated_at""",values)
+            imported += 1
+        connection.commit()
+    return imported
+
+def build_route_schedule_html(trip_name, start_date, route_payload):
+    try:
+        first_day = datetime.strptime(start_date, "%Y-%m-%d").date()
+    except ValueError:
+        first_day = date.today()
+    chunks = ["<html><head><meta charset='utf-8'><title>Sales Assistant Route</title></head><body>"]
+    for day in route_payload.get("days", []):
+        day_index = int(day.get("day_index", 0))
+        visit_date = first_day + timedelta(days=day_index)
+        chunks.append(f"<div class='scheduleday scheduleday_{visit_date.strftime('%Y%m%d')}'>")
+        chunks.append("<table>")
+        for stop in day.get("stops", []):
+            name = escape(str(stop.get("name", "Customer")))
+            arrival = escape(str(stop.get("arrival", "")))
+            note = escape(str(stop.get("call_note", "")))
+            duration = int(stop.get("duration", 45) or 45)
+            note_text = f"Route Planner · {duration} minute visit" + (f" · {note}" if note else "")
+            chunks.append("<tr class='stop'>")
+            chunks.append(f"<td class='time'>{arrival}</td><td class='reservation'>Appointment</td>")
+            chunks.append(f"<td class='displayname'><div>{name}</div><div class='callnote'>⇒ {note_text}</div></td>")
+            chunks.append("</tr>")
+        chunks.append("</table></div>")
+    chunks.append("</body></html>")
+    return "".join(chunks)
+
+
+def _normalise_date_input(value):
+    text=str(value or '').strip()
+    if not text:
+        return ''
+    for fmt in ('%Y-%m-%d','%d/%m/%Y','%d-%m-%Y','%Y/%m/%d'):
+        try:
+            return datetime.strptime(text[:10],fmt).date().isoformat()
+        except ValueError:
+            pass
+    return ''
+
+
+
+def _workspace_time_minutes(value):
+    text=str(value or '').strip()
+    match=re.search(r'(\d{1,2}):(\d{2})',text)
+    if not match:
+        return 8*60
+    return int(match.group(1))*60+int(match.group(2))
+
+
+def _workspace_clock(minutes):
+    minutes=int(minutes)%1440
+    return f"{minutes//60:02d}:{minutes%60:02d}"
+
+
+def _workspace_haversine(lat1,lon1,lat2,lon2):
+    from math import radians,sin,cos,asin,sqrt
+    r=6371.0; dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
+    q=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    return 2*r*asin(sqrt(q))
+
+
+def build_trip_workspace(trip_id):
+    import calendar as _calendar
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        trip=connection.execute('SELECT * FROM trip_plans WHERE id=?',(trip_id,)).fetchone()
+        if not trip:
+            return None
+        schedule=connection.execute('SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1',(trip_id,)).fetchone()
+        customers={r['name'].strip().casefold():dict(r) for r in connection.execute('SELECT * FROM route_customers').fetchall()}
+        actions={r['store_name'].strip().casefold():r['n'] for r in connection.execute("SELECT store_name,COUNT(*) n FROM store_actions WHERE status!='Completed' GROUP BY lower(store_name)").fetchall()}
+        notes={}
+        notes_by_appointment={}
+        notes_by_date_store={}
+        objectives={}
+        completed=0
+        if schedule:
+            for r in connection.execute('SELECT * FROM appointment_objectives WHERE schedule_id=?',(schedule['id'],)).fetchall(): objectives[r['appointment_id']]=dict(r)
+            for r in connection.execute('SELECT * FROM road_visit_notes WHERE schedule_id=?',(schedule['id'],)).fetchall():
+                record=dict(r)
+                key=(r['visit_date'],r['visit_time'],r['store_name'].strip().casefold())
+                notes[key]=record
+                if record.get('appointment_id'):
+                    notes_by_appointment[record['appointment_id']]=record
+                notes_by_date_store.setdefault((r['visit_date'],r['store_name'].strip().casefold()),[]).append(record)
+                if r['completed']: completed+=1
+    trip=dict(trip)
+    try:
+        sd=datetime.strptime(trip['start_date'],'%Y-%m-%d').date(); ed=datetime.strptime(trip['end_date'],'%Y-%m-%d').date()
+        trip['date_display']=sd.strftime('%d %b %Y') if sd==ed else f"{sd.strftime('%d %b')}–{ed.strftime('%d %b %Y')}"
+    except Exception:
+        sd=date.today(); ed=sd; trip['date_display']=f"{trip.get('start_date','')}–{trip.get('end_date','')}"
+    appointments=parse_schedule_appointments(schedule['raw_html'],date.min) if schedule else []
+    by_date={}
+    for appt in appointments:
+        by_date.setdefault(appt['date'],[]).append(appt)
+    days=[]; map_days=[]
+    for day_date in sorted(by_date):
+        calls=[]; timeline=[]; prior=None; total_visit=0
+        for appt in sorted(by_date[day_date],key=lambda x:_workspace_time_minutes(x['time'])):
+            customer=customers.get(appt['store'].strip().casefold(),{})
+            start=_workspace_time_minutes(appt['time']); duration=max(10,int(customer.get('ideal_call_minutes') or 45)); finish=start+duration
+            lat=customer.get('latitude'); lon=customer.get('longitude')
+            address=', '.join(x for x in [customer.get('street',''),customer.get('city',''),customer.get('zip','')] if x)
+            if prior and lat is not None and lon is not None and prior.get('latitude') is not None:
+                km=_workspace_haversine(float(prior['latitude']),float(prior['longitude']),float(lat),float(lon))
+                drive=max(3,round(km/65*60))
+                timeline.append({'type':'travel','start':_workspace_clock(max(0,start-drive)),'title':f"Drive to {appt['store']}",'detail':f"Approximately {km:.1f} km",'duration_display':f"~{drive} min"})
+            appt_id=appointment_uid(trip_id,schedule['id'] if schedule else 0,day_date.isoformat(),appt['time'],appt['store'])
+            note=notes_by_appointment.get(appt_id) or notes.get((day_date.isoformat(),appt['time'],appt['store'].strip().casefold())) or (notes_by_date_store.get((day_date.isoformat(),appt['store'].strip().casefold()),[{}])[0] if len(notes_by_date_store.get((day_date.isoformat(),appt['store'].strip().casefold()),[]))==1 else {})
+            obj=objectives.get(appt_id,{})
+            call={'type':'call','name':appt['store'],'start':_workspace_clock(start),'end':_workspace_clock(finish),'arrival':_workspace_clock(start),'departure':_workspace_clock(finish),'duration':duration,'address':address or customer.get('city',''),'customer_group':customer.get('customer_group') or classify_customer(appt['store']),'call_note':appt.get('call_note') or customer.get('call_note',''),'desired_outcome':obj.get('desired_outcome',''),'preparation_notes':obj.get('preparation_notes',''),'customer_url':url_for('customer_detail',store_name=appt['store']),'open_actions':int(actions.get(appt['store'].strip().casefold(),0)),'locked':'locked' in (appt.get('call_note') or '').lower(),'latitude':lat,'longitude':lon,'completed':bool(note.get('completed'))}
+            calls.append(call); timeline.append(call); total_visit+=duration; prior=call
+        day={'date_iso':day_date.isoformat(),'tab_label':day_date.strftime('%a %d'),'full_label':day_date.strftime('%A %d %B %Y'),'departure':calls[0]['arrival'] if calls else '','calls':calls,'timeline':timeline,'total_visit_display':f"{total_visit//60}h {total_visit%60}m" if total_visit>=60 else f"{total_visit} min"}
+        days.append(day); map_days.append({'full_label':day['full_label'],'stops':[c for c in calls if c.get('latitude') is not None and c.get('longitude') is not None]})
+    # calendar month containing trip start
+    month_start=sd.replace(day=1); cal=_calendar.Calendar(firstweekday=0); cells=[]
+    for d in cal.itermonthdates(month_start.year,month_start.month):
+        events=[]
+        matching=next((x for x in days if x['date_iso']==d.isoformat()),None)
+        if matching:
+            for c in matching['calls']:
+                events.append({'type':'','time':c['start'],'title':c['name']})
+        cells.append({'day':d.day,'outside':d.month!=month_start.month,'is_trip_day':bool(matching),'events':events})
+    closeout_visits=[]
+    completed_count=skipped_count=notes_count=0
+    all_customer_names=[]
+    for appt in appointments:
+        key=(appt['date'].isoformat(),appt['time'],appt['store'].strip().casefold())
+        appt_id=appointment_uid(trip_id,schedule['id'] if schedule else 0,appt['date'].isoformat(),appt['time'],appt['store'])
+        note=notes_by_appointment.get(appt_id) or notes.get(key) or (notes_by_date_store.get((appt['date'].isoformat(),appt['store'].strip().casefold()),[{}])[0] if len(notes_by_date_store.get((appt['date'].isoformat(),appt['store'].strip().casefold()),[]))==1 else {})
+        is_completed=bool(note.get('completed'))
+        is_skipped=bool(note.get('skipped'))
+        if is_completed:
+            status='Completed'; badge='change-positive'; completed_count+=1
+        elif is_skipped:
+            status='Skipped'; badge='change-negative'; skipped_count+=1
+        else:
+            status='Open'; badge='change-neutral'
+        if is_completed and str(note.get('visit_notes') or '').strip(): notes_count+=1
+        closeout_visits.append({'date_display':appt['date'].strftime('%d %b %Y'),'visit_time':appt['time'],'store_name':appt['store'],'status':status,'badge_class':badge,'visit_notes':note.get('visit_notes',''),'outcome':note.get('outcome',''),'next_step':note.get('next_step',''),'actual_duration':int(note.get('actual_duration_minutes') or 0)})
+        all_customer_names.append(appt['store'])
+    pending_actions=0
+    if all_customer_names:
+        with sqlite3.connect(DATABASE_PATH) as connection:
+            placeholders=','.join('?' for _ in all_customer_names)
+            pending_actions=connection.execute(f"SELECT COUNT(*) FROM store_actions WHERE status!='Completed' AND lower(store_name) IN ({placeholders})",tuple(x.strip().lower() for x in all_customer_names)).fetchone()[0]
+    trip['completed_at_display']=''
+    if trip.get('completed_at'):
+        try: trip['completed_at_display']=datetime.fromisoformat(trip['completed_at']).strftime('%d %b %Y at %I:%M %p')
+        except Exception: trip['completed_at_display']=trip['completed_at']
+    closeout={'total':len(appointments),'completed':completed_count,'skipped':skipped_count,'open':max(len(appointments)-completed_count-skipped_count,0),'notes_count':notes_count,'pending_actions':pending_actions,'visits':closeout_visits}
+    return {'trip':trip,'days':days,'total_calls':sum(len(d['calls']) for d in days),'completed_calls':completed,'map_days_json':json.dumps(map_days),'calendar':{'month_label':month_start.strftime('%B %Y'),'cells':cells},'closeout':closeout}
+
+
+@app.route('/trip-workspace/<int:trip_id>')
+def trip_workspace(trip_id):
+    set_active_trip(trip_id)
+    workspace=build_trip_workspace(trip_id)
+    if not workspace:
+        return redirect(url_for('trip_prep',error='Trip not found.'))
+    tab=request.args.get('tab','schedule').lower()
+    if tab not in {'schedule','map','calendar','closeout'}:
+        tab='schedule'
+    return render_template_string(PAGE,view='trip_workspace',workspace=workspace,workspace_tab=tab,open_action_count=get_open_action_count())
+
+@app.route('/trip-workspace/<int:trip_id>/closeout', methods=['POST'])
+def trip_closeout_action(trip_id):
+    action=request.form.get('action','save_notes')
+    notes_text=request.form.get('closeout_notes','').strip()
+    now=datetime.now().isoformat(timespec='seconds')
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        trip=connection.execute('SELECT * FROM trip_plans WHERE id=?',(trip_id,)).fetchone()
+        if not trip:
+            return redirect(url_for('trip_prep',error='Trip not found.'))
+        schedule=connection.execute('SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1',(trip_id,)).fetchone()
+        if action=='reopen':
+            connection.execute('UPDATE trip_plans SET completed_at=?,closeout_notes=?,updated_at=? WHERE id=?',('',notes_text,now,trip_id))
+            connection.commit()
+            return redirect(url_for('trip_workspace',trip_id=trip_id,tab='closeout',success='Trip reopened.'))
+        connection.execute('UPDATE trip_plans SET closeout_notes=?,updated_at=? WHERE id=?',(notes_text,now,trip_id))
+        created=0
+        if action=='close':
+            if request.form.get('create_reschedule_actions')=='1' and schedule:
+                appointments=parse_schedule_appointments(schedule['raw_html'],date.min)
+                saved=connection.execute('SELECT * FROM road_visit_notes WHERE schedule_id=?',(schedule['id'],)).fetchall()
+                note_map={(r['visit_date'],r['visit_time'],r['store_name'].strip().casefold()):r for r in saved}
+                existing={(r[0].strip().casefold(),r[1].strip().casefold()) for r in connection.execute("SELECT store_name,title FROM store_actions WHERE status!='Completed'").fetchall()}
+                for appt in appointments:
+                    row=note_map.get((appt['date'].isoformat(),appt['time'],appt['store'].strip().casefold()))
+                    if row and row['completed']:
+                        continue
+                    title='Reschedule missed visit'
+                    key=(appt['store'].strip().casefold(),title.casefold())
+                    if key in existing:
+                        continue
+                    detail='Skipped during trip.' if row and row['skipped'] else 'Planned call was not marked complete.'
+                    connection.execute("INSERT INTO store_actions (store_name,title,detail,priority,due_date,status,source,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",(appt['store'],title,detail,'Medium',(date.today()+timedelta(days=14)).isoformat(),'Open','Trip Close-Out','',now,now))
+                    existing.add(key); created+=1
+            connection.execute('UPDATE trip_plans SET completed_at=?,closeout_notes=?,updated_at=? WHERE id=?',(now,notes_text,now,trip_id))
+        connection.commit()
+    message='Close-out notes saved.' if action!='close' else f'Trip closed. {created} reschedule action(s) created.'
+    return redirect(url_for('trip_workspace',trip_id=trip_id,tab='closeout',success=message))
+
+
+@app.route('/trip-workspace/<int:trip_id>/closeout.pdf')
+def download_trip_closeout(trip_id):
+    workspace=build_trip_workspace(trip_id)
+    if not workspace:
+        return redirect(url_for('trip_prep',error='Trip not found.'))
+    buffer=BytesIO()
+    doc=SimpleDocTemplate(buffer,pagesize=A4,rightMargin=16*mm,leftMargin=16*mm,topMargin=15*mm,bottomMargin=15*mm)
+    styles=getSampleStyleSheet(); story=[]
+    story.append(Paragraph(escape(workspace['trip']['trip_name'])+' — Trip Close-Out',styles['Title']))
+    story.append(Paragraph(escape(workspace['trip'].get('date_display','')),styles['Normal'])); story.append(Spacer(1,6*mm))
+    c=workspace['closeout']
+    summary=[['Scheduled','Completed','Skipped','Open'],[str(c['total']),str(c['completed']),str(c['skipped']),str(c['open'])]]
+    table=Table(summary,colWidths=[42*mm]*4); table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#101828')),('TEXTCOLOR',(0,0),(-1,0),colors.white),('ALIGN',(0,0),(-1,-1),'CENTER'),('GRID',(0,0),(-1,-1),.5,colors.HexColor('#D0D5DD')),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('PADDING',(0,0),(-1,-1),7)])); story.append(table); story.append(Spacer(1,6*mm))
+    rows=[['Date / Time','Customer','Status','Outcome / Notes']]
+    for v in c['visits']:
+        text='; '.join(x for x in [v.get('outcome',''),v.get('visit_notes',''),('Next: '+v['next_step']) if v.get('next_step') else ''] if x)
+        rows.append([f"{v['date_display']} {v['visit_time']}",v['store_name'],v['status'],Paragraph(escape(text or '—'),styles['BodyText'])])
+    visit_table=Table(rows,colWidths=[34*mm,48*mm,23*mm,73*mm],repeatRows=1); visit_table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#EAF2FF')),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('VALIGN',(0,0),(-1,-1),'TOP'),('GRID',(0,0),(-1,-1),.35,colors.HexColor('#D0D5DD')),('PADDING',(0,0),(-1,-1),5)])); story.append(visit_table)
+    if workspace['trip'].get('closeout_notes'):
+        story.append(Spacer(1,6*mm)); story.append(Paragraph('Overall Close-Out Notes',styles['Heading2'])); story.append(Paragraph(escape(workspace['trip']['closeout_notes']).replace('\n','<br/>'),styles['BodyText']))
+    doc.build(story); buffer.seek(0)
+    filename=re.sub(r'[^A-Za-z0-9._-]+','_',workspace['trip']['trip_name']).strip('_')+'_closeout.pdf'
+    return send_file(buffer,as_attachment=True,download_name=filename,mimetype='application/pdf')
+
+
+def build_reliability_summary():
+    issues=[]
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        active_id=get_active_trip_id()
+        active=connection.execute("SELECT trip_name FROM trip_plans WHERE id=?",(active_id,)).fetchone() if active_id else None
+        missing_coords=connection.execute("SELECT COUNT(*) FROM route_customers WHERE latitude IS NULL OR longitude IS NULL OR latitude=0 OR longitude=0").fetchone()[0]
+        invalid_hours=connection.execute("SELECT COUNT(*) FROM route_customers WHERE customer_open_time>=customer_close_time").fetchone()[0]
+        duplicate_names=connection.execute("SELECT COUNT(*) FROM (SELECT lower(trim(name)) n,COUNT(*) c FROM route_customers GROUP BY n HAVING c>1)").fetchone()[0]
+        orphan_schedules=connection.execute("SELECT COUNT(*) FROM trip_schedules s LEFT JOIN trip_plans t ON t.id=s.trip_plan_id WHERE s.trip_plan_id IS NOT NULL AND t.id IS NULL").fetchone()[0]
+        orphan_notes=connection.execute("SELECT COUNT(*) FROM road_visit_notes n LEFT JOIN trip_schedules s ON s.id=n.schedule_id WHERE s.id IS NULL").fetchone()[0]
+        blank_appt_ids=connection.execute("SELECT COUNT(*) FROM road_visit_notes WHERE appointment_id='' AND (visit_notes!='' OR completed=1 OR skipped=1)").fetchone()[0]
+        trips=[dict(r) for r in connection.execute("SELECT id,trip_name,start_date FROM trip_plans ORDER BY start_date DESC,id DESC LIMIT 50").fetchall()]
+        recent_audit=[dict(r) for r in connection.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 20").fetchall()]
+    if missing_coords: issues.append(f'{missing_coords} customer(s) have missing map coordinates.')
+    if invalid_hours: issues.append(f'{invalid_hours} customer(s) have invalid opening hours.')
+    if duplicate_names: issues.append(f'{duplicate_names} duplicate customer-name group(s) exist.')
+    if orphan_schedules: issues.append(f'{orphan_schedules} schedule(s) are linked to missing trips.')
+    if orphan_notes: issues.append(f'{orphan_notes} visit-note record(s) are linked to missing schedules.')
+    if blank_appt_ids: issues.append(f'{blank_appt_ids} older visit record(s) do not yet have permanent appointment IDs; they will be upgraded when opened.')
+    backups=sorted(BACKUP_DIR.glob('*.db'),key=lambda x:x.stat().st_mtime,reverse=True)
+    return {'active_trip_id':active_id,'active_trip_name':active['trip_name'] if active else '', 'issue_count':len(issues),'issues':issues,'backup_count':len(backups),'latest_backup':backups[0].name if backups else '',
+            'backups':[{'name':b.name,'size':f'{b.stat().st_size/1024/1024:.1f} MB'} for b in backups[:10]],'trips':trips,'recent_audit':recent_audit}
+
+@app.route('/settings/restore/<path:filename>',methods=['POST'])
+def restore_backup(filename):
+    safe=Path(filename).name
+    source=BACKUP_DIR/safe
+    if not source.exists() or source.suffix!='.db':
+        return redirect(url_for('settings',error='Backup file not found.'))
+    create_database_backup('before_restore')
+    shutil.copy2(source,DATABASE_PATH)
+    init_database()
+    audit_event('backup_restored',safe)
+    return redirect(url_for('settings',success=f'Restored backup: {safe}'))
+
+@app.route('/settings/data-health.txt')
+def data_health_report():
+    summary=build_reliability_summary()
+    lines=['Riverlea Group Sales Assistant - Data Health Report',datetime.now().strftime('%d %b %Y %H:%M'),'']
+    lines.append('Active trip: '+(summary['active_trip_name'] or 'None'))
+    lines.append(f"Issues: {summary['issue_count']}")
+    lines.extend('- '+x for x in summary['issues'])
+    if not summary['issues']: lines.append('- No structural data problems detected.')
+    lines.append('')
+    lines.append(f"Backups: {summary['backup_count']}")
+    return app.response_class('\n'.join(lines),mimetype='text/plain',headers={'Content-Disposition':'attachment; filename=data-health-report.txt'})
+
+@app.route('/settings', methods=['GET','POST'])
+def settings():
+    if request.method == 'POST':
+        action=request.form.get('action','')
+        if action == 'create_backup':
+            backup=create_database_backup('manual')
+            audit_event('backup_created', backup.name if backup else 'No database')
+            return redirect(url_for('settings',success=f'Backup created: {backup.name}' if backup else 'No database was available to back up.'))
+        if action == 'set_active_trip':
+            try: trip_id=int(request.form.get('active_trip_id','') or 0)
+            except ValueError: trip_id=0
+            set_active_trip(trip_id or None)
+            audit_event('active_trip_changed', str(trip_id or 'none'), trip_id or None)
+            return redirect(url_for('settings',success='Active trip updated.'))
+        if action == 'save_route_defaults':
+            try:
+                save_route_defaults(
+                    request.form.get('route_rep_start','').strip(),
+                    request.form.get('route_rep_end','').strip(),
+                    request.form.get('route_customer_open','').strip(),
+                    request.form.get('route_customer_close','').strip(),
+                )
+            except ValueError as exc:
+                return redirect(url_for('settings',error=str(exc))+'#route-defaults')
+            audit_event('route_defaults_updated', 'General rep and customer hours')
+            return redirect(url_for('settings',success='General route defaults saved.')+'#route-defaults')
+        now=datetime.now().isoformat(timespec='seconds')
+        if action == 'bulk_update_customers':
+            ids=[int(x) for x in request.form.get('selected_customer_ids','').split(',') if x.strip().isdigit()]
+            if not ids:
+                return redirect(url_for('settings',error='Select at least one customer.'))
+            updates=[]; values=[]
+            raw_minutes=request.form.get('bulk_call_minutes','').strip()
+            raw_interval=request.form.get('bulk_call_interval','').strip()
+            tier=request.form.get('bulk_priority_tier','').strip().upper()
+            group=request.form.get('bulk_customer_group','').strip()
+            urgency=request.form.get('bulk_urgency','').strip().lower()
+            customer_open=request.form.get('bulk_customer_open','').strip()
+            customer_close=request.form.get('bulk_customer_close','').strip()
+            try:
+                if raw_minutes:
+                    updates.append('ideal_call_minutes=?'); values.append(max(10,min(240,int(raw_minutes))))
+                if raw_interval:
+                    updates.append('call_interval=?'); values.append(max(1,min(365,int(raw_interval))))
+            except ValueError:
+                return redirect(url_for('settings',error='Call duration and cycle must be valid numbers.'))
+            if tier in {'A','B','C','D'}: updates.append('priority_tier=?'); values.append(tier)
+            if group: updates.append('customer_group=?'); values.append(group)
+            if urgency in {'overdue','due','not due'}: updates.append('urgency=?'); values.append(urgency)
+            if re.fullmatch(r'\d{2}:\d{2}', customer_open): updates.append('customer_open_time=?'); values.append(customer_open)
+            if re.fullmatch(r'\d{2}:\d{2}', customer_close): updates.append('customer_close_time=?'); values.append(customer_close)
+            if customer_open and customer_close and customer_close <= customer_open:
+                return redirect(url_for('settings',error='Customer closing time must be later than opening time.'))
+            if not updates:
+                return redirect(url_for('settings',error='Enter at least one bulk value to apply.'))
+            updates.append('updated_at=?'); values.append(now)
+            marks=','.join('?' for _ in ids)
+            with sqlite3.connect(DATABASE_PATH) as connection:
+                connection.execute(f"UPDATE route_customers SET {', '.join(updates)} WHERE id IN ({marks})",values+ids)
+                connection.commit()
+            return redirect(url_for('settings',success=f'Updated {len(ids)} customers.'))
+        if action == 'save_customer_table':
+            ids=[]
+            for key in request.form.keys():
+                if key.startswith('name_') and key[5:].isdigit(): ids.append(int(key[5:]))
+            saved=0
+            try:
+                with sqlite3.connect(DATABASE_PATH) as connection:
+                    for customer_id in ids:
+                        old=connection.execute('SELECT name FROM route_customers WHERE id=?',(customer_id,)).fetchone()
+                        if not old: continue
+                        old_name=old[0]
+                        name=request.form.get(f'name_{customer_id}','').strip()
+                        if not name: raise ValueError(f'Customer {customer_id} has no name.')
+                        minutes=max(10,min(240,int(request.form.get(f'ideal_call_minutes_{customer_id}','45') or 45)))
+                        interval=max(1,min(365,int(request.form.get(f'call_interval_{customer_id}','42') or 42)))
+                        latitude=float(request.form.get(f'latitude_{customer_id}','0') or 0)
+                        longitude=float(request.form.get(f'longitude_{customer_id}','0') or 0)
+                        tier=request.form.get(f'priority_tier_{customer_id}','C').strip().upper()
+                        if tier not in {'A','B','C','D'}: tier='C'
+                        urgency=request.form.get(f'urgency_{customer_id}','').strip().lower()
+                        if urgency not in {'overdue','due','not due'}: urgency=''
+                        customer_open=request.form.get(f'customer_open_time_{customer_id}','08:00').strip() or '08:00'
+                        customer_close=request.form.get(f'customer_close_time_{customer_id}','17:00').strip() or '17:00'
+                        if customer_close <= customer_open: raise ValueError(f'{name}: closing time must be later than opening time.')
+                        connection.execute('''UPDATE route_customers SET name=?,street=?,city=?,zip=?,customer_group=?,priority_tier=?,ideal_call_minutes=?,customer_open_time=?,customer_close_time=?,call_interval=?,last_call=?,urgency=?,phone=?,email=?,latitude=?,longitude=?,call_note=?,updated_at=? WHERE id=?''',(
+                            name,request.form.get(f'street_{customer_id}','').strip(),request.form.get(f'city_{customer_id}','').strip(),request.form.get(f'zip_{customer_id}','').strip(),request.form.get(f'customer_group_{customer_id}','Other').strip() or 'Other',tier,minutes,customer_open,customer_close,interval,_normalise_date_input(request.form.get(f'last_call_{customer_id}','')),urgency,request.form.get(f'phone_{customer_id}','').strip(),request.form.get(f'email_{customer_id}','').strip(),latitude,longitude,request.form.get(f'call_note_{customer_id}','').strip(),now,customer_id))
+                        if name != old_name:
+                            connection.execute('UPDATE OR IGNORE customer_priorities SET store_name=? WHERE store_name=?',(name,old_name))
+                            connection.execute('UPDATE store_actions SET store_name=? WHERE store_name=?',(name,old_name))
+                            connection.execute('UPDATE road_visit_notes SET store_name=? WHERE store_name=?',(name,old_name))
+                        saved += 1
+                    connection.commit()
+            except sqlite3.IntegrityError:
+                return redirect(url_for('settings',error='Two customers cannot have the same name. Check any renamed customers.'))
+            except (ValueError,TypeError) as exc:
+                return redirect(url_for('settings',error=f'Could not save customer settings: {exc}'))
+            return redirect(url_for('settings',success=f'Saved changes for {saved} customers.'))
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        customers=[]
+        for row in connection.execute('SELECT * FROM route_customers ORDER BY name').fetchall():
+            item=dict(row)
+            item['last_call_date']=_normalise_date_input(item.get('last_call',''))
+            item['priority_tier']=(item.get('priority_tier') or 'C').upper()
+            customers.append(item)
+    groups=sorted({c['customer_group'] for c in customers if c.get('customer_group')} | {'Bunnings','Mitre 10 Mega','Mitre 10','ITM','Placemakers','Carters','Hammer Hardware','Buildlink','Other'})
+    reliability=build_reliability_summary()
+    return render_template_string(PAGE,view='settings',settings_customers=customers,settings_groups=groups,reliability=reliability,route_defaults=get_route_defaults(),success=request.args.get('success'),error=request.args.get('error'),open_action_count=get_open_action_count())
+
+@app.route('/route-planner', methods=['GET','POST'])
+def route_planner():
+    if request.method == 'POST':
+        action=request.form.get('action','')
+        if action == 'import_customers':
+            uploaded=request.files.get('customer_export')
+            if not uploaded or not uploaded.filename:
+                return redirect(url_for('route_planner',error='Choose a Portatour customer export first.'))
+            try:
+                create_database_backup('before_customer_import')
+                count=import_portatour_customers(uploaded)
+                audit_event('customer_import', f'{count} customers')
+            except Exception as exc: return redirect(url_for('route_planner',error=f'Customer import failed: {exc}'))
+            return redirect(url_for('route_planner',success=f'Updated {count} mapped customers and synced them to the Customers tab.'))
+        if action == 'save_customer_route_settings':
+            customer_id=request.form.get('customer_id','').strip()
+            try:
+                customer_id=int(customer_id)
+                ideal_minutes=max(10,min(240,int(request.form.get('ideal_call_minutes','45'))))
+            except (TypeError,ValueError):
+                return redirect(url_for('route_planner',error='Choose a customer and enter a valid call duration.'))
+            with sqlite3.connect(DATABASE_PATH) as connection:
+                customer=connection.execute('SELECT name FROM route_customers WHERE id=?',(customer_id,)).fetchone()
+                if not customer:
+                    return redirect(url_for('route_planner',error='Customer not found.'))
+                connection.execute('UPDATE route_customers SET ideal_call_minutes=?, updated_at=? WHERE id=?',(ideal_minutes,datetime.now().isoformat(timespec='seconds'),customer_id)); connection.commit()
+            return redirect(url_for('route_planner',success=f'Saved the standard call duration for {customer[0]}.'))
+        if action == 'create_trip_from_route':
+            trip_name=request.form.get('trip_name','').strip()
+            start_date=request.form.get('trip_start_date','').strip()
+            destination=request.form.get('route_destination','').strip()
+            try:
+                payload=json.loads(request.form.get('route_payload','{}'))
+                days=payload.get('days',[])
+                if not trip_name or not start_date or not days:
+                    raise ValueError('Trip name, first day and a built route are required.')
+                first=datetime.strptime(start_date,'%Y-%m-%d').date()
+                end_date=(first+timedelta(days=len(days)-1)).isoformat()
+            except Exception as exc:
+                return redirect(url_for('route_planner',error=f'Could not create trip: {exc}'))
+            now=datetime.now().isoformat(timespec='seconds')
+            schedule_html=build_route_schedule_html(trip_name,start_date,payload)
+            with sqlite3.connect(DATABASE_PATH) as connection:
+                cur=connection.execute("INSERT INTO trip_plans (trip_name,destination,start_date,end_date,travel_method,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",(trip_name,destination,start_date,end_date,'Drive','Created from Route Planner',now,now))
+                plan_id=cur.lastrowid
+                connection.execute("INSERT INTO trip_schedules (filename,raw_html,uploaded_at,trip_plan_id) VALUES (?,?,?,?)",(f'Route Planner - {trip_name}.html',schedule_html,now,plan_id))
+                connection.commit()
+            set_active_trip(plan_id)
+            audit_event('trip_created',trip_name,plan_id)
+            return redirect(url_for('trip_prep',trip=plan_id,generate=1,success=f'{trip_name} was created from the optimised route. Review appointments, brochures and readiness below.'))
+        if action == 'save_selection':
+            name=request.form.get('selection_name','').strip(); raw=request.form.get('selected_ids','').strip()
+            ids=[int(x) for x in raw.split(',') if x.strip().isdigit()]
+            if not name or not ids: return redirect(url_for('route_planner',error='Enter a name and select at least one customer.'))
+            with sqlite3.connect(DATABASE_PATH) as connection:
+                connection.execute('INSERT INTO route_selections (name,start_date,end_date,customer_ids,created_at) VALUES (?,?,?,?,?)',(name,request.form.get('start_date',''),request.form.get('end_date',''),','.join(map(str,ids)),datetime.now().isoformat(timespec='seconds'))); connection.commit()
+            return redirect(url_for('route_planner',success=f'Saved {name} with {len(ids)} customers.'))
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory=sqlite3.Row
+        customers=[dict(r) for r in connection.execute('SELECT * FROM route_customers ORDER BY name').fetchall()]
+        open_actions=connection.execute("SELECT store_name, COUNT(*) AS n FROM store_actions WHERE status != 'Completed' GROUP BY lower(store_name)").fetchall()
+        action_map={str(r['store_name']).strip().lower():int(r['n']) for r in open_actions}
+        priority_map={row['store_name'].strip().lower():row for row in build_customer_priority_rows()}
+        for customer in customers:
+            key=customer['name'].strip().lower()
+            customer['open_action_count']=action_map.get(key,0)
+            customer['priority_classification']=priority_map.get(key,{}).get('classification','')
+            customer['priority_score']=priority_map.get(key,{}).get('score',0)
+        saved=[]
+        for r in connection.execute('SELECT * FROM route_selections ORDER BY id DESC LIMIT 12').fetchall():
+            item=dict(r); item['count']=len([x for x in item['customer_ids'].split(',') if x]);
+            if item['start_date'] and item['end_date']: item['date_display']=f"{item['start_date']} to {item['end_date']}"
+            elif item['start_date']: item['date_display']=item['start_date']
+            else: item['date_display']=''
+            saved.append(item)
+    groups=sorted({c['customer_group'] for c in customers if c['customer_group']})
+    return render_template_string(PAGE,view='route_planner',map_customers=customers,route_groups=groups,saved_route_selections=saved,route_defaults=get_route_defaults(),success=request.args.get('success'),error=request.args.get('error'),open_action_count=get_open_action_count())
+
+@app.route('/route-planner/selections/<int:selection_id>/delete', methods=['POST'])
+def delete_route_selection(selection_id):
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        row = connection.execute('SELECT name FROM route_selections WHERE id=?', (selection_id,)).fetchone()
+        if not row:
+            return redirect(url_for('route_planner', error='Saved route selection was not found.'))
+        connection.execute('DELETE FROM route_selections WHERE id=?', (selection_id,))
+        connection.commit()
+    return redirect(url_for('route_planner', success=f'Deleted saved selection: {row[0]}.'))
+
+
+@app.route('/trip-plans/<int:trip_id>/delete', methods=['POST'])
+def delete_trip_plan(trip_id):
+    create_database_backup('before_trip_delete')
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        trip = connection.execute('SELECT * FROM trip_plans WHERE id=?', (trip_id,)).fetchone()
+        if not trip:
+            return redirect(url_for('trip_prep', error='Planned trip was not found.'))
+
+        schedule_rows = connection.execute(
+            "SELECT id FROM trip_schedules WHERE trip_plan_id=? OR (trip_plan_id IS NULL AND filename=?)",
+            (trip_id, f"Route Planner - {trip['trip_name']}.html"),
+        ).fetchall()
+        schedule_ids = [int(row['id']) for row in schedule_rows]
+        for schedule_id in schedule_ids:
+            connection.execute('DELETE FROM road_visit_notes WHERE schedule_id=?', (schedule_id,))
+            connection.execute('DELETE FROM road_visit_attachments WHERE schedule_id=?', (schedule_id,))
+        if schedule_ids:
+            placeholders = ','.join('?' for _ in schedule_ids)
+            connection.execute(f'DELETE FROM trip_schedules WHERE id IN ({placeholders})', schedule_ids)
+
+        connection.execute('DELETE FROM trip_plans WHERE id=?', (trip_id,))
+        connection.commit()
+
+    return redirect(url_for('trip_prep', success=f"Deleted planned trip: {trip['trip_name']}."))
 
 
 @app.route("/actions/<int:action_id>/delete", methods=["POST"])
