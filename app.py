@@ -1,5 +1,6 @@
 import json
 import re
+import csv
 import sqlite3
 import xml.etree.ElementTree as ET
 from io import BytesIO, StringIO
@@ -11,8 +12,23 @@ import os
 import uuid
 import shutil
 import hashlib
+from functools import wraps
+from collections.abc import Mapping
 
-from flask import Flask, redirect, render_template_string, request, send_file, url_for, send_from_directory
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+load_dotenv()
+
+from flask import Flask, redirect, render_template_string, request, send_file, url_for, send_from_directory, session, g, abort
 import pandas as pd
 from bs4 import BeautifulSoup
 from reportlab.lib import colors
@@ -20,31 +36,887 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from werkzeug.security import generate_password_hash, check_password_hash
+
 from reportlab.platypus import (
     KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 )
 
 app = Flask(__name__)
 
+# Authentication/session configuration. In Vercel, SECRET_KEY must be supplied
+# as an environment variable so signed login sessions remain valid across requests.
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+if os.environ.get("VERCEL") and not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is required on Vercel.")
+app.secret_key = SECRET_KEY or "riverlea-local-development-only-change-me"
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+FORCE_SQLITE = os.environ.get("FORCE_SQLITE", "").strip().lower() in {"1", "true", "yes", "on"}
+USE_POSTGRES = bool(DATABASE_URL) and not FORCE_SQLITE
+
+# Vercel's deployed filesystem is read-only. /tmp is writable for ephemeral files.
+_default_data_dir = Path("/tmp") if os.environ.get("VERCEL") else BASE_DIR
+DATA_DIR = Path(os.environ.get("DATA_DIR", _default_data_dir))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DATABASE_PATH = DATA_DIR / "sales_history.db"
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-def audit_event(event_type, detail="", trip_id=None, appointment_id=""):
+
+class HybridRow(Mapping):
+    """SQLite Row-like result supporting both row[0] and row['column']."""
+    def __init__(self, columns, values):
+        self._columns = list(columns)
+        self._values = tuple(values)
+        self._data = dict(zip(self._columns, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._columns)
+
+    def __len__(self):
+        return len(self._columns)
+
+    def keys(self):
+        return self._data.keys()
+
+
+class StaticCursor:
+    def __init__(self, rows):
+        self._rows = list(rows)
+        self.lastrowid = None
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+SERIAL_TABLES = {
+    'audit_log', 'monthly_sales', 'opportunity_analyses', 'follow_up_runs',
+    'trip_schedules', 'store_actions', 'travel_trips', 'road_visit_attachments',
+    'trip_plans', 'rep_bonus_transactions', 'customer_contacts', 'route_customers',
+    'route_selections'
+}
+
+
+def _pg_translate_sql(sql):
+    original = sql
+    sql = sql.strip()
+
+    # SQLite metadata queries used by the existing migration code.
+    pragma = re.fullmatch(r"PRAGMA\s+table_info\(([^)]+)\)", sql, flags=re.I)
+    if pragma:
+        return ('__table_info__', pragma.group(1).strip())
+
+    if re.search(r"FROM\s+sqlite_master\s+WHERE\s+type='table'", sql, flags=re.I):
+        return ('__table_names__', None)
+
+    # SQLite DDL/DML compatibility.
+    sql = re.sub(r'INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT', 'BIGSERIAL PRIMARY KEY', sql, flags=re.I)
+    sql = re.sub(r'UPDATE\s+OR\s+IGNORE', 'UPDATE', sql, flags=re.I)
+    sql = re.sub(r'COLLATE\s+NOCASE', '', sql, flags=re.I)
+    sql = sql.replace('?', '%s')
+    return (sql, None)
+
+
+class PostgresCursorAdapter:
+    def __init__(self, cursor, use_hybrid_rows=False, lastrowid=None):
+        self._cursor = cursor
+        self._hybrid = use_hybrid_rows
+        self.lastrowid = lastrowid
+
+    def _convert(self, row):
+        if row is None or not self._hybrid:
+            return row
+        columns = [desc.name for desc in self._cursor.description]
+        return HybridRow(columns, row)
+
+    def fetchone(self):
+        return self._convert(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._convert(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        for row in self._cursor:
+            yield self._convert(row)
+
+
+class PostgresConnectionAdapter:
+    def __init__(self):
+        if psycopg is None:
+            raise RuntimeError("Postgres mode requires psycopg. Install psycopg[binary].")
+        self._connection = psycopg.connect(DATABASE_URL)
+        self._row_factory_requested = False
+
+    @property
+    def row_factory(self):
+        return sqlite3.Row if self._row_factory_requested else None
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._row_factory_requested = value is not None
+
+    def execute(self, sql, params=()):
+        translated, special = _pg_translate_sql(sql)
+        if translated == '__table_info__':
+            table = special
+            cur = self._connection.cursor()
+            cur.execute(
+                "SELECT column_name, data_type, is_nullable, column_default "
+                "FROM information_schema.columns WHERE table_schema='public' AND table_name=%s "
+                "ORDER BY ordinal_position",
+                (table,),
+            )
+            # Match enough of SQLite PRAGMA table_info for existing row[1] column-name checks.
+            rows = [(idx, name, dtype, 0 if nullable == 'YES' else 1, default, 0)
+                    for idx, (name, dtype, nullable, default) in enumerate(cur.fetchall())]
+            cur.close()
+            return StaticCursor(rows)
+        if translated == '__table_names__':
+            cur = self._connection.cursor()
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+            rows = cur.fetchall()
+            cur.close()
+            return StaticCursor(rows)
+
+        query = translated
+        insert_match = re.match(r'\s*INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)', query, flags=re.I)
+        wants_lastrowid = False
+        if insert_match and insert_match.group(1).lower() in SERIAL_TABLES and not re.search(r'\bRETURNING\b', query, flags=re.I):
+            query = query.rstrip().rstrip(';') + ' RETURNING id'
+            wants_lastrowid = True
+
+        cur = self._connection.cursor()
+        cur.execute(query, params or ())
+        lastrowid = None
+        if wants_lastrowid:
+            returned = cur.fetchone()
+            lastrowid = returned[0] if returned else None
+        return PostgresCursorAdapter(cur, self._row_factory_requested, lastrowid)
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._connection.commit()
+        else:
+            self._connection.rollback()
+        self._connection.close()
+        return False
+
+
+def db_connect(path=None):
+    """Use Neon/Postgres when DATABASE_URL is present, otherwise the existing SQLite DB."""
+    if USE_POSTGRES:
+        return PostgresConnectionAdapter()
+    return sqlite3.connect(path or DATABASE_PATH)
+
+
+DB_ERRORS = (sqlite3.Error,) + ((psycopg.Error,) if psycopg is not None else ())
+DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,) + ((psycopg.IntegrityError,) if psycopg is not None else ())
+
+
+AUTH_ROLES = ("admin", "manager", "sales_rep")
+
+
+def ensure_auth_tables():
+    """Create the shared application user table and optionally bootstrap the first admin."""
+    with db_connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'sales_rep',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_login_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.commit()
+
+        bootstrap_email = os.environ.get("INITIAL_ADMIN_EMAIL", "").strip().lower()
+        bootstrap_password = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
+        bootstrap_name = os.environ.get("INITIAL_ADMIN_NAME", "Administrator").strip() or "Administrator"
+        count = connection.execute("SELECT COUNT(*) FROM app_users").fetchone()[0]
+        if count == 0 and bootstrap_email and bootstrap_password:
+            connection.execute(
+                "INSERT INTO app_users (email,display_name,password_hash,role,active,created_at,last_login_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    bootstrap_email,
+                    bootstrap_name,
+                    generate_password_hash(bootstrap_password),
+                    "admin",
+                    1,
+                    datetime.now().isoformat(timespec="seconds"),
+                    "",
+                ),
+            )
+            connection.commit()
+
+
+def _get_user_by_id(user_id):
+    if not user_id:
+        return None
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT id,email,display_name,role,active,created_at,last_login_at FROM app_users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _user_count():
     try:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            connection.execute("INSERT INTO audit_log (event_type,detail,trip_id,appointment_id,created_at) VALUES (?,?,?,?,?)",
-                               (event_type, str(detail or ""), trip_id, appointment_id or "", datetime.now().isoformat(timespec="seconds")))
+        with db_connect() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM app_users").fetchone()[0])
+    except Exception:
+        return 0
+
+
+@app.before_request
+def load_and_require_user():
+    # Health remains intentionally minimal/public for platform monitoring. Login is public.
+    public_endpoints = {"login", "cloud_health", "static"}
+    user_id = session.get("user_id")
+    g.current_user = _get_user_by_id(user_id) if user_id else None
+    if g.current_user and not g.current_user.get("active"):
+        session.clear()
+        g.current_user = None
+
+    if request.endpoint in public_endpoints or request.endpoint is None:
+        return None
+    if not g.current_user:
+        next_path = request.full_path if request.query_string else request.path
+        return redirect(url_for("login", next=next_path))
+    return None
+
+
+@app.context_processor
+def inject_auth_context():
+    return {"current_user": getattr(g, "current_user", None)}
+
+
+def admin_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        user = getattr(g, "current_user", None)
+        if not user or user.get("role") != "admin":
+            abort(403)
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+def territory_manager_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        user = getattr(g, "current_user", None)
+        if not user or user.get("role") not in {"admin", "manager"}:
+            abort(403)
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+def ensure_territory_schema():
+    """Add customer ownership without disturbing existing customer data."""
+    with db_connect() as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(route_customers)").fetchall()}
+        if "assigned_user_id" not in columns:
+            connection.execute("ALTER TABLE route_customers ADD COLUMN assigned_user_id INTEGER")
+        connection.commit()
+
+
+def _territory_user_id():
+    user = getattr(g, "current_user", None) or {}
+    return int(user["id"]) if user.get("role") == "sales_rep" and user.get("id") else None
+
+
+def _visible_customer_names():
+    user_id = _territory_user_id()
+    if user_id is None:
+        return None
+    with db_connect() as connection:
+        rows = connection.execute("SELECT name FROM route_customers WHERE assigned_user_id=?", (user_id,)).fetchall()
+    return {str(row[0]).strip().casefold() for row in rows if row[0]}
+
+
+def _customer_visible_to_current_user(store_name):
+    visible = _visible_customer_names()
+    return visible is None or str(store_name or "").strip().casefold() in visible
+
+
+def _filter_customer_rows(rows, name_key="store_name"):
+    visible = _visible_customer_names()
+    if visible is None:
+        return rows
+    return [row for row in rows if str(row.get(name_key, "")).strip().casefold() in visible]
+
+
+def _private_performance_user_id():
+    """Sales reps get a private performance workspace; managers/admins keep the team view."""
+    user = getattr(g, "current_user", None) or {}
+    return int(user["id"]) if user.get("role") == "sales_rep" and user.get("id") else None
+
+
+def _private_performance_name():
+    user = getattr(g, "current_user", None) or {}
+    if user.get("role") == "sales_rep":
+        return str(user.get("display_name") or user.get("email") or "Sales Rep").strip()
+    return ""
+
+
+def ensure_performance_owner_schema():
+    """Add per-rep ownership to saved performance data while preserving all existing rows."""
+    with db_connect() as connection:
+        for table in ("monthly_sales", "opportunity_analyses", "rep_bonus_transactions"):
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "owner_user_id" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN owner_user_id INTEGER")
+        connection.commit()
+
+        if USE_POSTGRES:
+            # The original desktop schema used global uniqueness. In the multi-user cloud
+            # version, owned rows must be unique inside a rep account, not across all reps.
+            for statement in (
+                "ALTER TABLE opportunity_analyses DROP CONSTRAINT IF EXISTS opportunity_analyses_store_name_key",
+                "ALTER TABLE monthly_sales DROP CONSTRAINT IF EXISTS monthly_sales_salesperson_year_month_key",
+                "ALTER TABLE rep_bonus_transactions DROP CONSTRAINT IF EXISTS rep_bonus_transactions_salesperson_doc_number_key",
+                "CREATE UNIQUE INDEX IF NOT EXISTS opportunity_analyses_owner_store_uq ON opportunity_analyses (owner_user_id, lower(trim(store_name))) WHERE owner_user_id IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS opportunity_analyses_legacy_store_uq ON opportunity_analyses (lower(trim(store_name))) WHERE owner_user_id IS NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS monthly_sales_owner_period_uq ON monthly_sales (owner_user_id, year, month) WHERE owner_user_id IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS monthly_sales_legacy_period_uq ON monthly_sales (lower(trim(salesperson)), year, month) WHERE owner_user_id IS NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS rep_bonus_owner_doc_uq ON rep_bonus_transactions (owner_user_id, doc_number) WHERE owner_user_id IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS rep_bonus_legacy_doc_uq ON rep_bonus_transactions (lower(trim(salesperson)), doc_number) WHERE owner_user_id IS NULL",
+            ):
+                connection.execute(statement)
+            connection.commit()
+
+
+def _private_workspace_user_id():
+    """Sales reps own their Actions and Checklist records; managers/admins keep the team view."""
+    user = getattr(g, "current_user", None) or {}
+    return int(user["id"]) if user.get("role") == "sales_rep" and user.get("id") else None
+
+
+def _action_owned_by_current_user(record):
+    owner_user_id = _private_workspace_user_id()
+    if owner_user_id is None:
+        return True
+    try:
+        value = record["owner_user_id"]
+    except Exception:
+        value = None
+    return value is not None and int(value) == owner_user_id
+
+
+def ensure_private_workspace_schema():
+    """Add private rep ownership for Actions and a separate personal weekly checklist."""
+    with db_connect() as connection:
+        action_columns = {row[1] for row in connection.execute("PRAGMA table_info(store_actions)").fetchall()}
+        if "owner_user_id" not in action_columns:
+            connection.execute("ALTER TABLE store_actions ADD COLUMN owner_user_id INTEGER")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_weekly_checklist (
+                owner_user_id INTEGER NOT NULL,
+                week_key TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                is_done INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_user_id, week_key, item_key)
+            )
+            """
+        )
+        connection.commit()
+
+
+def ensure_trip_owner_schema():
+    """Add per-user ownership to routes/trips while preserving existing legacy data."""
+    with db_connect() as connection:
+        for table in ("trip_plans", "trip_schedules", "route_selections"):
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "owner_user_id" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN owner_user_id INTEGER")
+        connection.commit()
+
+
+def ensure_customer_identity_schema():
+    """Attach durable route_customer IDs to customer-related records and backfill legacy rows."""
+    linked_tables = (
+        "customer_priorities", "store_actions", "opportunity_analyses", "customer_contacts",
+        "road_visit_notes", "road_visit_attachments", "appointment_objectives",
+    )
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        for table in linked_tables:
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "customer_id" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN customer_id INTEGER")
+        connection.commit()
+
+        customers = connection.execute("SELECT id,name FROM route_customers WHERE name IS NOT NULL AND trim(name)!=''").fetchall()
+        customer_map = {_customer_match_key(row[1]): int(row[0]) for row in customers if row[1]}
+        for table in linked_tables:
+            rows = connection.execute(f"SELECT * FROM {table} WHERE customer_id IS NULL").fetchall()
+            for row in rows:
+                try:
+                    store_name = row["store_name"]
+                except Exception:
+                    # compatibility rows may be tuple-like depending on backend wrapper
+                    columns = [r[1] for r in connection.execute(f"PRAGMA table_info({table})").fetchall()]
+                    try:
+                        store_name = row[columns.index("store_name")]
+                    except Exception:
+                        continue
+                customer_id = customer_map.get(_customer_match_key(store_name))
+                if customer_id:
+                    if table == "customer_priorities":
+                        connection.execute("UPDATE customer_priorities SET customer_id=? WHERE store_name=?", (customer_id, store_name))
+                    elif table == "road_visit_notes":
+                        connection.execute("UPDATE road_visit_notes SET customer_id=? WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?", (customer_id, row["schedule_id"], row["visit_date"], row["visit_time"], store_name))
+                    else:
+                        try:
+                            row_id = row["id"]
+                        except Exception:
+                            row_id = None
+                        if row_id is not None:
+                            connection.execute(f"UPDATE {table} SET customer_id=? WHERE id=?", (customer_id, row_id))
+                        elif table == "appointment_objectives":
+                            connection.execute("UPDATE appointment_objectives SET customer_id=? WHERE appointment_id=?", (customer_id, row["appointment_id"]))
+        connection.commit()
+
+
+def _resolve_customer_id(connection, store_name):
+    key = _customer_match_key(store_name)
+    if not key:
+        return None
+    rows = connection.execute("SELECT id,name FROM route_customers WHERE name IS NOT NULL").fetchall()
+    for row in rows:
+        if _customer_match_key(row[1]) == key:
+            return int(row[0])
+    return None
+
+
+def _customer_link_clause(customer_id, store_name, column_prefix=""):
+    prefix = f"{column_prefix}." if column_prefix else ""
+    if customer_id:
+        return f"({prefix}customer_id=? OR ({prefix}customer_id IS NULL AND lower(trim({prefix}store_name))=lower(trim(?))))", [customer_id, store_name]
+    return f"lower(trim({prefix}store_name))=lower(trim(?))", [store_name]
+
+
+def _trip_owner_user_id():
+    user = getattr(g, "current_user", None) or {}
+    return int(user["id"]) if user.get("role") == "sales_rep" and user.get("id") else None
+
+
+def _trip_row_for_current_user(connection, trip_id):
+    owner_user_id = _trip_owner_user_id()
+    if owner_user_id is None:
+        return connection.execute("SELECT * FROM trip_plans WHERE id=?", (trip_id,)).fetchone()
+    return connection.execute("SELECT * FROM trip_plans WHERE id=? AND owner_user_id=?", (trip_id, owner_user_id)).fetchone()
+
+
+def _trip_accessible(trip_id):
+    if not trip_id:
+        return False
+    with db_connect() as connection:
+        return _trip_row_for_current_user(connection, trip_id) is not None
+
+
+def _current_user_state_key(base_key):
+    user = getattr(g, "current_user", None) or {}
+    user_id = user.get("id")
+    return f"{base_key}:user:{user_id}" if user_id else base_key
+
+
+TERRITORIES_PAGE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Territories · Riverlea</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+<style>:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17202a;background:#f4f7fa}*{box-sizing:border-box}body{margin:0}.wrap{max-width:1400px;margin:auto;padding:28px}.head{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:20px}.card{background:#fff;border:1px solid #dfe6ec;border-radius:15px;padding:20px;margin-bottom:18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.stat{background:#f7fafc;border:1px solid #e5ebef;border-radius:12px;padding:14px}.stat strong{display:block;font-size:24px}.toolbar{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1.25fr;gap:10px;margin-bottom:14px}input,select{width:100%;border:1px solid #cfd8df;border-radius:9px;padding:9px 10px;font:inherit}button,.btn{border:0;border-radius:9px;background:#108dbd;color:#fff;padding:9px 13px;font-weight:800;text-decoration:none;cursor:pointer}.secondary{background:#445765}.danger{background:#9b3c3c}.muted{color:#71808d}.msg{padding:10px 12px;background:#eaf8ef;border:1px solid #bfe3ca;border-radius:9px;margin-bottom:15px}.err{background:#fff0f0;border-color:#edc2c2}.mapgrid{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,.8fr);gap:16px}.mapbox{min-height:590px;border:1px solid #dfe6ec;border-radius:13px;overflow:hidden}#territory-map{height:590px}.side{display:flex;flex-direction:column;gap:12px}.selection-list{border:1px solid #e3e9ed;border-radius:10px;max-height:310px;overflow:auto;padding:8px}.selected-row{display:flex;justify-content:space-between;gap:8px;padding:7px 6px;border-bottom:1px solid #edf1f4;font-size:13px}.selected-row:last-child{border-bottom:0}.small{font-size:12px}.bulk-actions{display:grid;gap:9px}.bulk-actions .row{display:grid;grid-template-columns:1fr auto;gap:8px}.legend{display:grid;gap:5px;font-size:12px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;border:1px solid rgba(0,0,0,.2)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid #edf1f4;font-size:14px}th{font-size:12px;color:#687783;text-transform:uppercase}.tablewrap{max-height:600px;overflow:auto}.rowform{display:flex;gap:8px;align-items:center}.rowform select{min-width:190px}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#edf4f7;font-size:12px}.health{display:inline-block;padding:3px 7px;border-radius:999px;font-size:11px;margin:2px 3px 2px 0;background:#edf4f7}.health.overdue{background:#fff1e8;color:#9a4d00}.health.action{background:#fff0f0;color:#9b2c2c}.health.good{background:#eaf8ef;color:#25633b}.health.opp{background:#eef2ff;color:#4338ca}.checkcell{width:38px;text-align:center}.leaflet-popup-content{font-family:inherit}.leaflet-control-layers{font-family:inherit}@media(max-width:900px){.mapgrid{grid-template-columns:1fr}.mapbox,#territory-map{height:500px;min-height:500px}.stats,.toolbar{grid-template-columns:1fr 1fr}}@media(max-width:620px){.stats,.toolbar{grid-template-columns:1fr}.head{align-items:flex-start;flex-direction:column}.wrap{padding:16px}}</style></head>
+<body><main class="wrap"><div class="head"><div><h1 style="margin:0 0 5px">Sales Territories</h1><div class="muted">Select customers on the map, then assign them to a Sales Rep in one action.</div></div><a class="btn secondary" href="{{ url_for('control_centre') }}">Back to Sales Assistant</a></div>
+{% if success %}<div class="msg">{{ success }}</div>{% endif %}{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+<div class="card"><div class="stats"><div class="stat"><span class="muted">Customers</span><strong>{{ stats.total }}</strong></div><div class="stat"><span class="muted">Assigned</span><strong>{{ stats.assigned }}</strong></div><div class="stat"><span class="muted">Unassigned</span><strong>{{ stats.unassigned }}</strong></div><div class="stat"><span class="muted">Selected</span><strong id="selected-count">0</strong></div></div></div>
+<div class="card"><div class="toolbar"><input id="territory-search" placeholder="Search customer, city or group"><select id="territory-rep-filter"><option value="">All assignments</option><option value="unassigned">Unassigned</option>{% for rep in reps %}<option value="{{ rep.id }}">{{ rep.display_name }}</option>{% endfor %}</select><select id="group-filter"><option value="">All customer groups</option>{% for group in groups %}<option value="{{ group }}">{{ group }}</option>{% endfor %}</select><select id="tier-filter"><option value="">All tiers</option>{% for tier in ['A','B','C','D'] %}<option value="{{ tier }}">Tier {{ tier }}</option>{% endfor %}</select><select id="status-filter"><option value="">All coverage statuses</option><option value="overdue">Overdue for call</option><option value="overdue_a">Overdue Tier A</option><option value="stale60">No visit 60+ days</option><option value="stale90">No visit 90+ days</option><option value="overdue_action">Overdue Action</option><option value="opportunity">Saved opportunity</option><option value="healthy">Within call cycle</option><option value="unassigned">Unassigned customer</option></select></div>
+<div class="mapgrid"><div class="mapbox"><div id="territory-map"></div></div><aside class="side"><div><strong>Map selection</strong><div class="muted small">Use the rectangle or polygon tools on the map, click pins for exceptions, or use Select all filtered.</div></div><div class="bulk-actions"><button type="button" id="select-filtered">Select all filtered</button><button type="button" id="clear-selected" class="secondary">Clear selection</button><button type="button" id="fit-visible" class="secondary">Fit visible customers</button></div><div><strong>Selected customers</strong><div id="selection-list" class="selection-list"><div class="muted small">No customers selected.</div></div></div>
+<form method="post" id="bulk-form" class="bulk-actions"><input type="hidden" name="bulk_action" value="1"><input type="hidden" name="customer_ids" id="customer-ids"><label><strong>Assign selection to</strong><select name="assigned_user_id" id="bulk-rep"><option value="">Unassigned</option>{% for rep in reps %}<option value="{{ rep.id }}">{{ rep.display_name }}</option>{% endfor %}</select></label><button type="submit" id="assign-selected">Assign selected customers</button></form><div class="legend"><strong>Pin assignment</strong>{% for rep in reps %}<span><i class="dot" style="background:{{ rep.colour }}"></i>{{ rep.display_name }}</span>{% endfor %}<span><i class="dot" style="background:#7f8c8d"></i>Unassigned</span><span><i class="dot" style="background:#111827"></i>Selected</span></div></aside></div></div>
+<div class="card"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px"><div><strong>Customer table</strong><div class="muted small">Coverage status is calculated from visit history, call cycle, saved opportunities and overdue Actions.</div></div></div><div class="tablewrap"><table id="territory-table"><thead><tr><th class="checkcell">Pick</th><th>Customer</th><th>Group</th><th>City</th><th>Tier</th><th>Coverage</th><th>Assigned rep</th></tr></thead><tbody>{% for c in customers %}<tr data-id="{{ c.id }}" data-search="{{ (c.name ~ ' ' ~ c.city ~ ' ' ~ c.customer_group)|lower }}" data-rep="{{ c.assigned_user_id or 'unassigned' }}" data-group="{{ c.customer_group }}" data-tier="{{ c.priority_tier }}"><td class="checkcell"><input type="checkbox" class="pick" value="{{ c.id }}"></td><td><strong><a href="{{ url_for('customer_detail_by_id', customer_id=c.id) }}">{{ c.name }}</a></strong></td><td>{{ c.customer_group }}</td><td>{{ c.city }}</td><td><span class="pill">{{ c.priority_tier }}</span></td><td>{% if c.overdue %}<span class="health overdue">Overdue{% if c.days_since_visit is not none %} {{ c.days_since_visit }}d{% endif %}</span>{% else %}<span class="health good">In cycle</span>{% endif %}{% if c.overdue_actions %}<span class="health action">{{ c.overdue_actions }} overdue action{% if c.overdue_actions != 1 %}s{% endif %}</span>{% endif %}{% if c.opportunity_value > 0 %}<span class="health opp">{{ c.opportunity_display }} opportunity</span>{% endif %}</td><td><form class="rowform" method="post"><input type="hidden" name="customer_id" value="{{ c.id }}"><select name="assigned_user_id"><option value="">Unassigned</option>{% for rep in reps %}<option value="{{ rep.id }}" {% if c.assigned_user_id == rep.id %}selected{% endif %}>{{ rep.display_name }}</option>{% endfor %}</select><button type="submit">Save</button></form></td></tr>{% endfor %}</tbody></table></div></div></main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+const customers={{ customers|tojson }}, reps={{ reps|tojson }};
+const q=document.getElementById('territory-search'),rf=document.getElementById('territory-rep-filter'),gf=document.getElementById('group-filter'),tf=document.getElementById('tier-filter'),sf=document.getElementById('status-filter');
+const selected=new Set(), markerById=new Map(), customerById=new Map(customers.map(c=>[Number(c.id),c]));
+const repColour=new Map(reps.map(r=>[String(r.id),r.colour]));
+const map=L.map('territory-map',{zoomControl:true}).setView([-40.8,172.7],5); L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+const drawnItems=new L.FeatureGroup().addTo(map); map.addControl(new L.Control.Draw({draw:{polyline:false,circle:false,circlemarker:false,marker:false,rectangle:true,polygon:{allowIntersection:false,showArea:true}},edit:{featureGroup:drawnItems,edit:false,remove:true}}));
+function matches(c){const text=q.value.trim().toLowerCase(),rep=rf.value,group=gf.value,tier=tf.value,status=sf.value;let statusOk=!status||(status==='overdue'&&c.overdue)||(status==='overdue_a'&&c.overdue&&c.priority_tier==='A')||(status==='stale60'&&c.stale60)||(status==='stale90'&&c.stale90)||(status==='overdue_action'&&Number(c.overdue_actions)>0)||(status==='opportunity'&&Number(c.opportunity_value)>0)||(status==='healthy'&&!c.overdue)||(status==='unassigned'&&!c.assigned_user_id);return (!text||(`${c.name||''} ${c.city||''} ${c.customer_group||''}`).toLowerCase().includes(text))&&(!rep||String(c.assigned_user_id||'unassigned')===rep)&&(!group||c.customer_group===group)&&(!tier||c.priority_tier===tier)&&statusOk}
+function colour(c){return selected.has(Number(c.id))?'#111827':(repColour.get(String(c.assigned_user_id))||'#7f8c8d')}
+function icon(c){const col=colour(c);return L.divIcon({className:'',html:`<div style="width:17px;height:17px;border-radius:50%;background:${col};border:3px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.45)"></div>`,iconSize:[17,17],iconAnchor:[8,8]})}
+function popup(c){const rep=reps.find(r=>Number(r.id)===Number(c.assigned_user_id));const coverage=c.overdue?`Overdue${c.days_since_visit!=null?' · '+c.days_since_visit+' days since visit':''}`:'Within call cycle';const actions=c.overdue_actions?`<br><span style="color:#9b2c2c">${c.overdue_actions} overdue action${c.overdue_actions===1?'':'s'}</span>`:'';const opp=Number(c.opportunity_value)>0?`<br><span style="color:#4338ca">${c.opportunity_display} saved opportunity</span>`:'';return `<strong>${c.name}</strong><br>${c.customer_group||''} · ${c.city||''}<br><span style="color:#687783">${rep?rep.display_name:'Unassigned'} · Tier ${c.priority_tier||''}</span><br><strong>${coverage}</strong>${actions}${opp}` }
+customers.forEach(c=>{const id=Number(c.id);if(c.latitude==null||c.longitude==null)return;const m=L.marker([Number(c.latitude),Number(c.longitude)],{icon:icon(c),title:c.name}).bindPopup(popup(c));m.on('click',()=>toggle(id));markerById.set(id,m);m.addTo(map)});
+function toggle(id,on){if(on===true)selected.add(id);else if(on===false)selected.delete(id);else selected.has(id)?selected.delete(id):selected.add(id);updateSelection()}
+function updateSelection(){document.getElementById('selected-count').textContent=selected.size;document.getElementById('customer-ids').value=[...selected].join(',');document.querySelectorAll('.pick').forEach(cb=>cb.checked=selected.has(Number(cb.value)));markerById.forEach((m,id)=>m.setIcon(icon(customerById.get(id))));const box=document.getElementById('selection-list');if(!selected.size){box.innerHTML='<div class="muted small">No customers selected.</div>';return}const rows=[...selected].map(id=>customerById.get(id)).filter(Boolean).sort((a,b)=>a.name.localeCompare(b.name));box.innerHTML=rows.map(c=>`<div class="selected-row"><span>${c.name}<br><span class="muted">${c.city||''}</span></span><button type="button" class="secondary remove-selected" data-id="${c.id}">Remove</button></div>`).join('');box.querySelectorAll('.remove-selected').forEach(b=>b.addEventListener('click',()=>toggle(Number(b.dataset.id),false)))}
+function apply(){document.querySelectorAll('#territory-table tbody tr').forEach(r=>{const c=customerById.get(Number(r.dataset.id));r.style.display=matches(c)?'':'none'});markerById.forEach((m,id)=>{const c=customerById.get(id);if(matches(c)){if(!map.hasLayer(m))m.addTo(map)}else if(map.hasLayer(m))map.removeLayer(m)})}
+[q,rf,gf,tf].forEach(el=>el.addEventListener(el===q?'input':'change',apply));document.querySelectorAll('.pick').forEach(cb=>cb.addEventListener('change',()=>toggle(Number(cb.value),cb.checked)));
+document.getElementById('select-filtered').addEventListener('click',()=>{customers.filter(matches).forEach(c=>selected.add(Number(c.id)));updateSelection()});document.getElementById('clear-selected').addEventListener('click',()=>{selected.clear();drawnItems.clearLayers();updateSelection()});document.getElementById('fit-visible').addEventListener('click',()=>{const pts=customers.filter(c=>matches(c)&&c.latitude!=null&&c.longitude!=null).map(c=>[c.latitude,c.longitude]);if(pts.length)map.fitBounds(pts,{padding:[20,20]})});
+function pointInsidePolygon(lat,lng,latlngs){let inside=false;for(let i=0,j=latlngs.length-1;i<latlngs.length;j=i++){const xi=latlngs[i].lng,yi=latlngs[i].lat,xj=latlngs[j].lng,yj=latlngs[j].lat;const hit=((yi>lat)!=(yj>lat))&&(lng<(xj-xi)*(lat-yi)/(yj-yi)+xi);if(hit)inside=!inside}return inside}
+map.on(L.Draw.Event.CREATED,e=>{drawnItems.addLayer(e.layer);customers.forEach(c=>{if(!matches(c)||c.latitude==null||c.longitude==null)return;let hit=false;if(e.layer instanceof L.Rectangle)hit=e.layer.getBounds().contains([c.latitude,c.longitude]);else if(e.layer instanceof L.Polygon){const vs=e.layer.getLatLngs()[0];hit=pointInsidePolygon(Number(c.latitude),Number(c.longitude),vs)}if(hit)selected.add(Number(c.id))});updateSelection()});
+document.getElementById('bulk-form').addEventListener('submit',e=>{if(!selected.size){e.preventDefault();alert('Select at least one customer first.');return}const target=document.getElementById('bulk-rep'),name=target.value?(target.options[target.selectedIndex].text):'Unassigned';const transferring=[...selected].map(id=>customerById.get(id)).filter(c=>c.assigned_user_id&&String(c.assigned_user_id)!==String(target.value));if(transferring.length&&!confirm(`${transferring.length} selected customer(s) are already assigned to another rep. Transfer them to ${name}?`)){e.preventDefault();return}if(!confirm(`Assign ${selected.size} selected customer(s) to ${name}?`))e.preventDefault()});
+const params=new URLSearchParams(window.location.search);if(params.get('rep'))rf.value=params.get('rep');if(params.get('status'))sf.value=params.get('status');if(params.get('tier'))tf.value=params.get('tier');applyFilters();
+requestAnimationFrame(()=>{map.invalidateSize(true);const pts=customers.filter(c=>c.latitude!=null&&c.longitude!=null).map(c=>[c.latitude,c.longitude]);if(pts.length)map.fitBounds(pts,{padding:[20,20]})});
+</script></body></html>
+"""
+
+
+@app.route("/territories", methods=["GET", "POST"])
+@territory_manager_required
+def manage_territories():
+    if request.method == "POST":
+        raw_user_id = request.form.get("assigned_user_id", "").strip()
+        assigned_user_id = None
+        if raw_user_id:
+            try:
+                assigned_user_id = int(raw_user_id)
+            except ValueError:
+                return redirect(url_for("manage_territories", error="Invalid sales rep."))
+        with db_connect() as connection:
+            if assigned_user_id is not None:
+                rep = connection.execute("SELECT id,display_name FROM app_users WHERE id=? AND role='sales_rep' AND active=1", (assigned_user_id,)).fetchone()
+                if not rep:
+                    return redirect(url_for("manage_territories", error="Choose an active Sales Rep account."))
+                assigned_label = rep[1]
+            else:
+                assigned_label = "Unassigned"
+            if request.form.get("bulk_action") == "1":
+                raw_ids = request.form.get("customer_ids", "")
+                try:
+                    customer_ids = sorted({int(x) for x in raw_ids.split(",") if x.strip()})
+                except ValueError:
+                    return redirect(url_for("manage_territories", error="Invalid customer selection."))
+                if not customer_ids:
+                    return redirect(url_for("manage_territories", error="Select at least one customer."))
+                placeholders = ",".join("?" for _ in customer_ids)
+                existing = connection.execute(f"SELECT id FROM route_customers WHERE id IN ({placeholders})", tuple(customer_ids)).fetchall()
+                valid_ids = [int(r[0]) for r in existing]
+                if not valid_ids:
+                    return redirect(url_for("manage_territories", error="No valid customers were selected."))
+                placeholders = ",".join("?" for _ in valid_ids)
+                params = [assigned_user_id, datetime.now().isoformat(timespec="seconds"), *valid_ids]
+                connection.execute(f"UPDATE route_customers SET assigned_user_id=?, updated_at=? WHERE id IN ({placeholders})", tuple(params))
+                connection.commit()
+                audit_event("territory_bulk_assignment", f"{len(valid_ids)} customers -> {assigned_user_id or 'unassigned'}")
+                return redirect(url_for("manage_territories", success=f"Assigned {len(valid_ids)} customers to {assigned_label}."))
+            try:
+                customer_id = int(request.form.get("customer_id", "0"))
+            except ValueError:
+                return redirect(url_for("manage_territories", error="Invalid customer."))
+            customer = connection.execute("SELECT name FROM route_customers WHERE id=?", (customer_id,)).fetchone()
+            if not customer:
+                return redirect(url_for("manage_territories", error="Customer not found."))
+            connection.execute("UPDATE route_customers SET assigned_user_id=?, updated_at=? WHERE id=?", (assigned_user_id, datetime.now().isoformat(timespec="seconds"), customer_id))
+            connection.commit()
+        audit_event("territory_assignment", f"{customer[0]} -> {assigned_user_id or 'unassigned'}")
+        return redirect(url_for("manage_territories", success=f"Territory assignment saved for {customer[0]}."))
+    colours = ["#108dbd", "#d97706", "#7c3aed", "#059669", "#dc2626", "#2563eb", "#a21caf", "#65a30d", "#0f766e", "#c2410c"]
+    today = date.today()
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        reps = [dict(r) for r in connection.execute("SELECT id,display_name,email FROM app_users WHERE role='sales_rep' AND active=1 ORDER BY display_name").fetchall()]
+        for index, rep in enumerate(reps):
+            rep["colour"] = colours[index % len(colours)]
+        customers = [dict(r) for r in connection.execute("SELECT id,name,city,customer_group,priority_tier,assigned_user_id,latitude,longitude,last_call,call_interval FROM route_customers ORDER BY name").fetchall()]
+        priority_rows = [dict(r) for r in connection.execute("SELECT customer_id,store_name,last_visit_date FROM customer_priorities").fetchall()]
+        visit_rows = [dict(r) for r in connection.execute("SELECT customer_id,store_name,MAX(visit_date) AS last_visit_date FROM road_visit_notes WHERE completed=1 GROUP BY customer_id,store_name").fetchall()]
+        action_rows = [dict(r) for r in connection.execute("SELECT customer_id,store_name,COUNT(*) AS n FROM store_actions WHERE status!='Completed' AND due_date!='' AND due_date<? GROUP BY customer_id,store_name", (today.isoformat(),)).fetchall()]
+        analysis_rows = [dict(r) for r in connection.execute("SELECT customer_id,store_name,analysis_json FROM opportunity_analyses").fetchall()]
+    by_id = {int(c["id"]): c for c in customers}
+    by_name = {str(c["name"] or "").strip().casefold(): c for c in customers}
+    def resolve(row):
+        cid = row.get("customer_id")
+        if cid not in (None, ""):
+            try:
+                if int(cid) in by_id: return by_id[int(cid)]
+            except (TypeError, ValueError): pass
+        return by_name.get(str(row.get("store_name") or "").strip().casefold())
+    last_seen = {}
+    for row in priority_rows + visit_rows:
+        c = resolve(row)
+        raw = str(row.get("last_visit_date") or "")[:10]
+        if c and raw:
+            try:
+                d = date.fromisoformat(raw)
+                if int(c["id"]) not in last_seen or d > last_seen[int(c["id"])]: last_seen[int(c["id"])] = d
+            except ValueError: pass
+    overdue_actions = {}
+    for row in action_rows:
+        c = resolve(row)
+        if c: overdue_actions[int(c["id"])] = overdue_actions.get(int(c["id"]), 0) + int(row.get("n") or 0)
+    opportunities = {}
+    for row in analysis_rows:
+        c = resolve(row)
+        if not c: continue
+        try:
+            value = parse_currency_value((json.loads(row.get("analysis_json") or "{}") or {}).get("total_opp_gap", 0))
+        except (json.JSONDecodeError, TypeError):
+            value = 0
+        opportunities[int(c["id"])] = max(opportunities.get(int(c["id"]), 0), float(value or 0))
+    for c in customers:
+        cid = int(c["id"])
+        last = last_seen.get(cid)
+        if not last:
+            raw = str(c.get("last_call") or "")[:10]
+            try: last = date.fromisoformat(raw) if raw else None
+            except ValueError: last = None
+        days = (today - last).days if last else None
+        interval = max(1, int(c.get("call_interval") or 42))
+        c["days_since_visit"] = days
+        c["overdue"] = (days is None or days > interval)
+        c["stale60"] = (days is None or days >= 60)
+        c["stale90"] = (days is None or days >= 90)
+        c["overdue_actions"] = overdue_actions.get(cid, 0)
+        c["opportunity_value"] = opportunities.get(cid, 0)
+        c["opportunity_display"] = money(c["opportunity_value"])
+    assigned = sum(1 for c in customers if c.get("assigned_user_id"))
+    stats = {"total": len(customers), "assigned": assigned, "unassigned": len(customers)-assigned}
+    groups = sorted({(c.get("customer_group") or "Other") for c in customers})
+    return render_template_string(TERRITORIES_PAGE, reps=reps, customers=customers, groups=groups, stats=stats, success=request.args.get("success"), error=request.args.get("error"))
+
+
+LOGIN_PAGE = r"""
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Riverlea Sales Assistant</title>
+<style>
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17202a;background:#f4f7fa}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top left,#eaf6fd 0,#f4f7fa 38%,#eef2f5 100%)}
+.login{width:min(430px,100%);background:#fff;border:1px solid #dfe6ec;border-radius:20px;padding:32px;box-shadow:0 24px 70px rgba(28,47,63,.12)}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:28px}.mark{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:#23313d;color:white;font-weight:800}.brand strong{font-size:21px}.brand span{display:block;color:#657482;font-size:13px;margin-top:2px}
+h1{font-size:28px;margin:0 0 7px}p{color:#667581;line-height:1.5;margin:0 0 24px}label{display:block;font-weight:700;font-size:13px;margin:16px 0 7px}input{width:100%;border:1px solid #cfd8df;border-radius:10px;padding:12px 13px;font:inherit;outline:none}input:focus{border-color:#1495c7;box-shadow:0 0 0 3px rgba(20,149,199,.13)}button{width:100%;border:0;border-radius:10px;background:#108dbd;color:#fff;padding:12px 16px;font-weight:800;font-size:15px;margin-top:20px;cursor:pointer}.error{background:#fff1f1;border:1px solid #f1c4c4;color:#a52b2b;padding:10px 12px;border-radius:10px;margin-bottom:16px}.note{font-size:12px;color:#87939d;margin-top:18px}
+</style></head><body><main class="login"><div class="brand"><div class="mark">R</div><div><strong>Riverlea Group</strong><span>Sales Assistant</span></div></div>
+<h1>Welcome back</h1><p>Sign in to access customer, route and trip information.</p>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if no_users %}<div class="error">No application users exist yet. Configure INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD, then restart/redeploy once.</div>{% endif %}
+<form method="post"><input type="hidden" name="next" value="{{ next_path }}"><label>Email</label><input type="email" name="email" autocomplete="username" required autofocus><label>Password</label><input type="password" name="password" autocomplete="current-password" required><button type="submit">Sign in</button></form>
+<div class="note">Access is limited to authorised Riverlea users.</div></main></body></html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if getattr(g, "current_user", None):
+        return redirect(url_for("control_centre"))
+    error = ""
+    next_path = request.values.get("next", "") or url_for("control_centre")
+    if not (next_path.startswith("/") and not next_path.startswith("//")):
+        next_path = url_for("control_centre")
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        with db_connect() as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT id,email,display_name,password_hash,role,active FROM app_users WHERE lower(email)=lower(?)",
+                (email,),
+            ).fetchone()
+            user = dict(row) if row else None
+            if user and user.get("active") and check_password_hash(user.get("password_hash", ""), password):
+                session.clear()
+                session.permanent = True
+                session["user_id"] = user["id"]
+                connection.execute(
+                    "UPDATE app_users SET last_login_at=? WHERE id=?",
+                    (datetime.now().isoformat(timespec="seconds"), user["id"]),
+                )
+                connection.commit()
+                audit_event("login", f"User signed in: {user['email']}")
+                return redirect(next_path)
+        error = "Email or password is incorrect."
+    return render_template_string(LOGIN_PAGE, error=error, next_path=next_path, no_users=(_user_count() == 0))
+
+
+@app.route("/logout")
+def logout():
+    email = (getattr(g, "current_user", None) or {}).get("email", "")
+    session.clear()
+    if email:
+        audit_event("logout", f"User signed out: {email}")
+    return redirect(url_for("login"))
+
+
+USERS_PAGE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>User Management · Riverlea</title>
+<style>:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17202a;background:#f4f7fa}*{box-sizing:border-box}body{margin:0}.wrap{max-width:1180px;margin:auto;padding:28px}.head{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:22px}.card{background:#fff;border:1px solid #dfe6ec;border-radius:15px;padding:20px;margin-bottom:18px}.grid{display:grid;grid-template-columns:2fr 2fr 1.2fr 1.5fr auto;gap:10px;align-items:end}label{font-size:12px;font-weight:800;display:block;margin-bottom:6px}input,select{width:100%;border:1px solid #cfd8df;border-radius:9px;padding:10px;font:inherit}button,.btn{border:0;border-radius:9px;background:#108dbd;color:white;padding:10px 14px;font-weight:800;text-decoration:none;cursor:pointer}.secondary{background:#445765}.danger{background:#b42318}.muted{color:#71808c}.small{font-size:12px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px 9px;border-bottom:1px solid #edf1f4;font-size:14px;vertical-align:top}th{font-size:12px;color:#687783;text-transform:uppercase}.pill{display:inline-block;border-radius:999px;background:#eef4f7;padding:4px 8px;font-size:12px}.msg{padding:10px 12px;background:#eaf8ef;border:1px solid #bfe3ca;border-radius:9px;margin-bottom:15px}.err{background:#fff0f0;border-color:#edc2c2}.user-edit{display:grid;grid-template-columns:minmax(130px,1.2fr) minmax(180px,1.6fr) minmax(120px,.9fr) auto;gap:8px;align-items:end}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.pw{display:flex;gap:8px;align-items:center;margin-top:8px}.pw input{max-width:220px}.self{font-size:11px;font-weight:800;color:#108dbd;margin-left:6px}.tablewrap{overflow-x:auto}@media(max-width:850px){.grid,.user-edit{grid-template-columns:1fr}.head{align-items:flex-start;flex-direction:column}.pw{align-items:stretch;flex-direction:column}.pw input{max-width:none}}</style></head><body><div class="wrap"><div class="head"><div><h1 style="margin:0">User Management</h1><p style="margin:6px 0;color:#657482">Create, edit and manage Riverlea application users.</p></div><div><a class="btn secondary" href="{{ url_for('settings') }}">Back to Settings</a> <a class="btn secondary" href="{{ url_for('logout') }}">Sign out</a></div></div>
+{% if success %}<div class="msg">{{ success }}</div>{% endif %}{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+<div class="card"><h2 style="margin-top:0">Add user</h2><form method="post"><input type="hidden" name="action" value="create"><div class="grid"><div><label>Name</label><input name="display_name" required></div><div><label>Email</label><input type="email" name="email" required></div><div><label>Role</label><select name="role"><option value="sales_rep">Sales Rep</option><option value="manager">Sales Manager</option><option value="admin">Admin</option></select></div><div><label>Temporary password</label><input type="password" name="password" minlength="10" required></div><button>Add user</button></div></form></div>
+<div class="card"><h2 style="margin-top:0">Current users</h2><p class="muted small">Deleting a Sales Rep unassigns their territory customers but preserves their historical performance and action records. You cannot delete your own signed-in account or remove the last active Admin.</p><div class="tablewrap"><table><thead><tr><th>User details</th><th>Status</th><th>Last login</th><th>Account controls</th></tr></thead><tbody>{% for user in users %}<tr><td colspan="4"><form method="post" class="user-edit"><input type="hidden" name="user_id" value="{{ user.id }}"><div><label>Name{% if user.id == current_user_id %}<span class="self">YOU</span>{% endif %}</label><input name="display_name" value="{{ user.display_name }}" required></div><div><label>Email</label><input type="email" name="email" value="{{ user.email }}" required></div><div><label>Role</label><select name="role"><option value="sales_rep" {% if user.role == 'sales_rep' %}selected{% endif %}>Sales Rep</option><option value="manager" {% if user.role == 'manager' %}selected{% endif %}>Sales Manager</option><option value="admin" {% if user.role == 'admin' %}selected{% endif %}>Admin</option></select></div><button name="action" value="edit_user">Save changes</button><div><span class="pill">{{ 'Active' if user.active else 'Disabled' }}</span></div><div class="muted small">{{ user.last_login_at or 'Never' }}</div><div class="actions"><button name="action" value="toggle_active" class="secondary">{{ 'Disable' if user.active else 'Enable' }}</button><button name="action" value="delete_user" class="danger" onclick="return confirm('Delete {{ user.display_name|e }}? Their territory customers will become unassigned. Historical performance and actions will be preserved.')">Delete user</button></div><div class="pw"><input type="password" name="new_password" placeholder="New password" minlength="10"><button name="action" value="reset_password" class="secondary">Reset password</button></div></form></td></tr>{% endfor %}</tbody></table></div></div></div></body></html>
+"""
+
+
+@app.route("/users", methods=["GET", "POST"])
+@admin_required
+def manage_users():
+    success = request.args.get("success", "")
+    error = request.args.get("error", "")
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        try:
+            with db_connect() as connection:
+                if action == "create":
+                    email = request.form.get("email", "").strip().lower()
+                    display_name = request.form.get("display_name", "").strip()
+                    role = request.form.get("role", "sales_rep")
+                    password = request.form.get("password", "")
+                    if role not in AUTH_ROLES or not email or not display_name or len(password) < 10:
+                        raise ValueError("Enter a name, valid role, email and password of at least 10 characters.")
+                    existing = connection.execute("SELECT id FROM app_users WHERE lower(email)=lower(?)", (email,)).fetchone()
+                    if existing:
+                        raise ValueError("That email address is already used by another account.")
+                    connection.execute(
+                        "INSERT INTO app_users (email,display_name,password_hash,role,active,created_at,last_login_at) VALUES (?,?,?,?,?,?,?)",
+                        (email, display_name, generate_password_hash(password), role, 1, datetime.now().isoformat(timespec="seconds"), ""),
+                    )
+                    connection.commit()
+                    audit_event("user_created", f"{email} ({role})")
+                    return redirect(url_for("manage_users", success="User created."))
+
+                user_id = int(request.form.get("user_id", "0") or 0)
+                target = connection.execute("SELECT id,email,display_name,role,active FROM app_users WHERE id=?", (user_id,)).fetchone()
+                if not target:
+                    raise ValueError("User account not found.")
+
+                if action == "edit_user":
+                    email = request.form.get("email", "").strip().lower()
+                    display_name = request.form.get("display_name", "").strip()
+                    role = request.form.get("role", "sales_rep")
+                    if role not in AUTH_ROLES or not email or not display_name:
+                        raise ValueError("Enter a name, valid email address and role.")
+                    duplicate = connection.execute("SELECT id FROM app_users WHERE lower(email)=lower(?) AND id<>?", (email, user_id)).fetchone()
+                    if duplicate:
+                        raise ValueError("That email address is already used by another account.")
+                    if user_id == g.current_user["id"] and role != "admin":
+                        raise ValueError("You cannot remove your own Admin role while signed in.")
+                    if target[3] == "admin" and role != "admin" and int(target[4] or 0) == 1:
+                        other_active_admins = connection.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND id<>?", (user_id,)).fetchone()[0]
+                        if int(other_active_admins or 0) == 0:
+                            raise ValueError("You cannot change the role of the last active Admin.")
+                    territory_note = ""
+                    if target[3] == "sales_rep" and role != "sales_rep":
+                        territory_count = connection.execute("SELECT COUNT(*) FROM route_customers WHERE assigned_user_id=?", (user_id,)).fetchone()[0]
+                        if territory_count:
+                            connection.execute("UPDATE route_customers SET assigned_user_id=NULL, updated_at=? WHERE assigned_user_id=?", (datetime.now().isoformat(timespec="seconds"), user_id))
+                            territory_note = f" {territory_count} territory customer(s) were unassigned."
+                    connection.execute("UPDATE app_users SET email=?, display_name=?, role=? WHERE id=?", (email, display_name, role, user_id))
+                    connection.commit()
+                    audit_event("user_edited", f"User ID {user_id}: {email} ({role})")
+                    return redirect(url_for("manage_users", success="User details updated." + territory_note))
+
+                if action == "reset_password":
+                    password = request.form.get("new_password", "")
+                    if len(password) < 10:
+                        raise ValueError("New password must be at least 10 characters.")
+                    connection.execute("UPDATE app_users SET password_hash=? WHERE id=?", (generate_password_hash(password), user_id))
+                    connection.commit()
+                    audit_event("password_reset", f"User ID {user_id}")
+                    return redirect(url_for("manage_users", success="Password reset."))
+
+                if action == "toggle_active":
+                    if user_id == g.current_user["id"]:
+                        raise ValueError("You cannot disable your own account while signed in.")
+                    if target[3] == "admin" and int(target[4] or 0) == 1:
+                        other_active_admins = connection.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND id<>?", (user_id,)).fetchone()[0]
+                        if int(other_active_admins or 0) == 0:
+                            raise ValueError("You cannot disable the last active Admin.")
+                    connection.execute("UPDATE app_users SET active=CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?", (user_id,))
+                    connection.commit()
+                    audit_event("user_status_changed", f"User ID {user_id}")
+                    return redirect(url_for("manage_users", success="User status updated."))
+
+                if action == "delete_user":
+                    if user_id == g.current_user["id"]:
+                        raise ValueError("You cannot delete your own account while signed in.")
+                    if target[3] == "admin" and int(target[4] or 0) == 1:
+                        other_active_admins = connection.execute("SELECT COUNT(*) FROM app_users WHERE role='admin' AND active=1 AND id<>?", (user_id,)).fetchone()[0]
+                        if int(other_active_admins or 0) == 0:
+                            raise ValueError("You cannot delete the last active Admin.")
+                    territory_count = connection.execute("SELECT COUNT(*) FROM route_customers WHERE assigned_user_id=?", (user_id,)).fetchone()[0]
+                    if territory_count:
+                        connection.execute("UPDATE route_customers SET assigned_user_id=NULL, updated_at=? WHERE assigned_user_id=?", (datetime.now().isoformat(timespec="seconds"), user_id))
+                    # Weekly checklist state is disposable. Historical performance/actions retain their owner_user_id
+                    # so deletion never destroys rep-entered business history.
+                    try:
+                        connection.execute("DELETE FROM user_weekly_checklist WHERE owner_user_id=?", (user_id,))
+                    except Exception:
+                        pass
+                    connection.execute("DELETE FROM app_users WHERE id=?", (user_id,))
+                    connection.commit()
+                    audit_event("user_deleted", f"User ID {user_id}: {target[1]} ({target[3]}), {territory_count} territory customers unassigned")
+                    message = "User deleted."
+                    if territory_count:
+                        message += f" {territory_count} territory customer(s) were returned to Unassigned."
+                    return redirect(url_for("manage_users", success=message))
+
+        except Exception as exc:
+            return redirect(url_for("manage_users", error=str(exc)))
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT id,email,display_name,role,active,created_at,last_login_at FROM app_users ORDER BY active DESC,display_name,email").fetchall()
+        users = [dict(row) for row in rows]
+    return render_template_string(USERS_PAGE, users=users, success=success, error=error, current_user_id=g.current_user["id"])
+
+def audit_event(event_type, detail="", trip_id=None, appointment_id=""):
+    """Record a lightweight business audit event, including the signed-in actor when available."""
+    try:
+        actor = getattr(g, "current_user", None) or {}
+        actor_user_id = actor.get("id")
+        actor_email = str(actor.get("email") or "")
+        with db_connect() as connection:
+            connection.execute(
+                "INSERT INTO audit_log (event_type,detail,trip_id,appointment_id,actor_user_id,actor_email,created_at) VALUES (?,?,?,?,?,?,?)",
+                (event_type, str(detail or ""), trip_id, appointment_id or "", actor_user_id, actor_email, datetime.now().isoformat(timespec="seconds")),
+            )
             connection.commit()
     except Exception:
         pass
 
 def create_database_backup(reason="manual"):
+    # Neon handles durable database storage/backups in cloud mode. This legacy
+    # local-file backup is retained only for the SQLite desktop version.
+    if USE_POSTGRES:
+        return None
     if not DATABASE_PATH.exists():
         return None
     stamp=datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -76,6 +948,11 @@ def ensure_reliability_tables(connection):
             created_at TEXT NOT NULL
         )"""
     )
+    audit_columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_log)").fetchall()}
+    if "actor_user_id" not in audit_columns:
+        connection.execute("ALTER TABLE audit_log ADD COLUMN actor_user_id INTEGER")
+    if "actor_email" not in audit_columns:
+        connection.execute("ALTER TABLE audit_log ADD COLUMN actor_email TEXT NOT NULL DEFAULT ''")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS trip_appointments (
             appointment_id TEXT PRIMARY KEY,
@@ -105,25 +982,25 @@ def ensure_reliability_tables(connection):
 
 
 def set_active_trip(trip_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         ensure_reliability_tables(connection)
         connection.execute(
-            "INSERT INTO app_state (state_key,state_value,updated_at) VALUES ('active_trip_id',?,?) "
+            "INSERT INTO app_state (state_key,state_value,updated_at) VALUES (?,?,?) "
             "ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value,updated_at=excluded.updated_at",
-            (str(trip_id or ""), datetime.now().isoformat(timespec="seconds")),
+            (_current_user_state_key("active_trip_id"), str(trip_id or ""), datetime.now().isoformat(timespec="seconds")),
         )
         connection.commit()
 
 
 def get_active_trip_id():
     try:
-        with sqlite3.connect(DATABASE_PATH) as connection:
+        with db_connect() as connection:
             ensure_reliability_tables(connection)
             row = connection.execute(
-                "SELECT state_value FROM app_state WHERE state_key='active_trip_id'"
+                "SELECT state_value FROM app_state WHERE state_key=?", (_current_user_state_key("active_trip_id"),)
             ).fetchone()
             connection.commit()
-    except sqlite3.Error:
+    except DB_ERRORS:
         return None
     try:
         return int(row[0]) if row and row[0] else None
@@ -141,7 +1018,7 @@ ROUTE_DEFAULTS = {
 def get_route_defaults():
     values = dict(ROUTE_DEFAULTS)
     try:
-        with sqlite3.connect(DATABASE_PATH) as connection:
+        with db_connect() as connection:
             ensure_reliability_tables(connection)
             rows = connection.execute(
                 "SELECT state_key,state_value FROM app_state WHERE state_key IN ('route_rep_start','route_rep_end','route_customer_open','route_customer_close')"
@@ -156,7 +1033,7 @@ def get_route_defaults():
         for key, value in rows:
             if key in mapping and re.fullmatch(r'\d{2}:\d{2}', value or ''):
                 values[mapping[key]] = value
-    except sqlite3.Error:
+    except DB_ERRORS:
         pass
     return values
 
@@ -175,7 +1052,7 @@ def save_route_defaults(rep_start, rep_end, customer_open, customer_close):
     if customer_close <= customer_open:
         raise ValueError('Customer closing time must be later than opening time.')
     now = datetime.now().isoformat(timespec='seconds')
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         ensure_reliability_tables(connection)
         for key, value in values.items():
             connection.execute(
@@ -1418,6 +2295,39 @@ PAGE = r"""
             .riverlea-name{font-size:29px}.riverlea-wordmark{min-width:154px}.product-title{display:none}
         }
 
+
+        /* Stage 18 mobile field-sales polish retained in Stage 19 */
+        @media(max-width:760px){
+            html{-webkit-text-size-adjust:100%} body{overflow-x:hidden}
+            button,.button-link,.view-link,.header-link,.workspace-tabs a,.workspace-day-tabs button{min-height:44px}
+            input,select,textarea{font-size:16px;min-height:44px}
+            textarea{min-height:110px}
+            .app-shell-header{gap:10px}.header-actions{width:100%;display:flex;gap:7px;overflow-x:auto;padding-bottom:3px}.header-actions>*{flex:0 0 auto}
+            .workflow-shell{overflow:hidden}.workspace-nav{padding-bottom:4px}
+            .heading-row{align-items:flex-start;gap:10px}.heading-row>div:first-child{min-width:0}
+            .heading-row>.button-link,.heading-row>button{flex:0 0 auto}
+            .plan-form-grid,.priority-form-grid,.road-fields,.trip-form-grid{grid-template-columns:1fr!important;min-width:0!important}
+            .customer-hero{grid-template-columns:1fr!important}.customer-stat{min-width:0}
+            .customer-grid,.customer-detail-grid{grid-template-columns:1fr!important}
+            .customer-action-card{padding:14px}.customer-action-top{gap:10px;align-items:flex-start}
+            .road-card{padding:15px}.road-store{font-size:20px}.road-live-actions{position:sticky;bottom:8px;z-index:18;background:rgba(255,255,255,.97);padding:8px;margin:12px -7px 0;border:1px solid #d8dee2;border-radius:12px;box-shadow:0 6px 22px rgba(16,24,40,.12);display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.road-live-actions>*{margin:0!important}.road-live-actions a,.road-live-actions button{width:100%;height:100%}
+            .road-note-toolbar{display:grid!important;grid-template-columns:1fr;gap:9px}.road-note-toolbar button{width:100%}
+            .workspace-tabs{overflow-x:auto;display:flex!important;flex-wrap:nowrap!important;gap:6px;padding:6px 0}.workspace-tabs a{white-space:nowrap;flex:0 0 auto}
+            .workspace-day-tabs{display:flex!important;overflow-x:auto;flex-wrap:nowrap!important;gap:7px;padding-bottom:6px}.workspace-day-tabs button{white-space:nowrap;flex:0 0 auto}
+            .schedule-row{grid-template-columns:1fr!important;gap:8px}.schedule-main{border-left:0!important;border-top:3px solid var(--riverlea-blue);padding-left:0!important;padding-top:8px}.schedule-side{text-align:left!important}
+            #route-map{height:58vh!important;min-height:390px}.route-layout,.route-grid{grid-template-columns:1fr!important}.route-controls,.route-filter-grid,.route-setting-grid{grid-template-columns:1fr!important}.route-actions{display:grid!important;grid-template-columns:1fr 1fr;gap:8px}.route-actions button{width:100%}
+            .daily-hours-card{grid-template-columns:auto 1fr 1fr!important}.locked-row{grid-template-columns:1fr!important}.locked-row button{width:100%}
+            .selected-customer{align-items:flex-start}.selected-customer>button{min-width:88px}
+            .route-result-summary{grid-template-columns:repeat(2,minmax(0,1fr))!important}.route-day-header{align-items:flex-start!important;gap:10px}.route-day-header a{white-space:nowrap}.route-stop{grid-template-columns:38px minmax(0,1fr)!important}.route-stop-time{grid-column:2;text-align:left!important;padding-top:5px}
+            .table-wrap,.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+            .finder-table{min-width:760px}
+            .action-cell{white-space:normal}.action-cell form{display:inline-block;margin-top:6px}
+            .button-row{display:grid;grid-template-columns:1fr;gap:8px}.button-row>*{width:100%;text-align:center}
+        }
+        @media(max-width:480px){
+            .page{padding-left:10px;padding-right:10px}.panel{padding:14px}.route-result-summary{grid-template-columns:1fr 1fr!important}.road-live-actions{grid-template-columns:1fr 1fr}.riverlea-name{font-size:26px}
+        }
+
     </style>
 </head>
 <body>
@@ -1442,7 +2352,10 @@ PAGE = r"""
             </div>
         </div>
         <div class="header-actions">
+            {% if current_user and current_user.role in ['admin','manager'] %}<a href="{{ url_for('team_dashboard') }}" class="header-link {% if view == 'team_dashboard' %}active{% endif %}">Team</a><a href="{{ url_for('manage_territories') }}" class="header-link">Territories</a>{% endif %}
+            {% if current_user and current_user.role == 'admin' %}<a href="{{ url_for('data_recovery') }}" class="header-link">Data &amp; Recovery</a><a href="{{ url_for('manage_users') }}" class="header-link">Users</a>{% endif %}
             <a href="{{ url_for('settings') }}" class="header-link {% if view == 'settings' %}active{% endif %}">Settings</a>
+            {% if current_user %}<span class="small" style="margin-left:8px;">{{ current_user.display_name }}</span><a href="{{ url_for('logout') }}" class="header-link">Sign out</a>{% endif %}
         </div>
     </header>
 
@@ -1457,6 +2370,7 @@ PAGE = r"""
         </nav>
         <nav class="workspace-nav" aria-label="Sales tools">
             <span class="workspace-label">TOOLS</span>
+            {% if current_user and current_user.role in ['admin','manager'] %}<a href="{{ url_for('team_dashboard') }}" class="{% if view == 'team_dashboard' %}active{% endif %}">Team</a>{% endif %}
             <a href="{{ url_for('customer_priorities') }}" class="{% if view in ['customer_priorities','customer_detail'] %}active{% endif %}">Customers</a>
             <a href="{{ url_for('home') }}" class="{% if view in ['dashboard','history','saved_month','opportunities','opportunity_library','saved_opportunity','visit_brief','qtr_bonus'] %}active{% endif %}">Performance</a>
             <a href="{{ url_for('actions') }}" class="{% if view in ['actions','action_form'] %}active{% endif %}">Actions{% if open_action_count %} <b>{{ open_action_count }}</b>{% endif %}</a>
@@ -1473,6 +2387,7 @@ PAGE = r"""
             {% elif view == 'trip_workspace' %}<span class="eyebrow">TRIP WORKSPACE</span><h2>Saved Trip</h2><p>Review the same trip as a schedule, map or calendar.</p>
             {% elif view == 'on_the_road' %}<span class="eyebrow">STEP 4 · ON THE ROAD</span><h2>Today’s Calls</h2><p>Navigate, record visits, capture evidence and create follow-ups.</p>
             {% elif view == 'follow_up' %}<span class="eyebrow">STEP 5 · CLOSE OUT</span><h2>After Trip</h2><p>Finish notes, assign actions and clear outstanding work.</p>
+            {% elif view == 'team_dashboard' %}<span class="eyebrow">TEAM MANAGEMENT</span><h2>Sales Team Dashboard</h2><p>Compare territory coverage, activity, follow-up and upcoming trips by rep.</p>
             {% elif view in ['customer_priorities','customer_detail'] %}<span class="eyebrow">CUSTOMER HUB</span><h2>Customers</h2><p>Manage customer value, visit priority, history and open actions.</p>
             {% elif view == 'settings' %}<span class="eyebrow">ADMINISTRATION</span><h2>Settings</h2><p>Manage customer records, route defaults and bulk updates.</p>
             {% elif view == 'travel_expenses' %}<span class="eyebrow">TRAVEL</span><h2>Travel &amp; Expenses</h2><p>Track bookings, forecasts and actual trip costs.</p>
@@ -1492,11 +2407,11 @@ PAGE = r"""
 
     {% if view == 'settings' %}
     <div class="panel">
-        <div class="heading-row"><div><h2>Reliability & Data Protection</h2><p>Keep trip data linked correctly, check database health, and manage automatic backups.</p></div></div>
+        <div class="heading-row"><div><h2>Reliability & Data Protection</h2><p>Check workflow health here. Admin exports, audit history and recovery controls are available in Data &amp; Recovery.</p></div>{% if current_user and current_user.role == 'admin' %}<a class="button-link secondary" href="{{ url_for('data_recovery') }}">Open Data &amp; Recovery</a>{% endif %}</div>
         <div class="mini-grid">
             <div class="mini-card"><div class="label">Active trip</div><div class="value" style="font-size:18px;">{{ reliability.active_trip_name or 'None selected' }}</div><div class="small">Used by On the Road and Close Out</div></div>
             <div class="mini-card"><div class="label">Data health</div><div class="value">{{ reliability.issue_count }}</div><div class="small">issue{% if reliability.issue_count != 1 %}s{% endif %} detected</div></div>
-            <div class="mini-card"><div class="label">Backups</div><div class="value">{{ reliability.backup_count }}</div><div class="small">Latest: {{ reliability.latest_backup or 'None yet' }}</div></div>
+            <div class="mini-card"><div class="label">Storage mode</div><div class="value" style="font-size:18px;">{{ 'Cloud Postgres' if reliability.cloud_mode else 'Local SQLite' }}</div><div class="small">{{ 'Neon database · use Admin snapshot exports for app-level recovery copies' if reliability.cloud_mode else ((reliability.backup_count|string) + ' local backup(s)') }}</div></div>
         </div>
         {% if reliability.issues %}<div class="error" style="margin-top:16px;"><strong>Data health findings</strong><ul>{% for issue in reliability.issues %}<li>{{ issue }}</li>{% endfor %}</ul></div>{% else %}<div class="success" style="margin-top:16px;">No structural data problems detected.</div>{% endif %}
         <form method="post" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-top:16px;">
@@ -1505,10 +2420,11 @@ PAGE = r"""
             <button type="submit">Set Active Trip</button>
         </form>
         <div class="button-row" style="text-align:left;">
-            <form method="post" style="display:inline;"><input type="hidden" name="action" value="create_backup"><button type="submit">Create Backup Now</button></form>
+            {% if not reliability.cloud_mode %}<form method="post" style="display:inline;"><input type="hidden" name="action" value="create_backup"><button type="submit">Create Local Backup</button></form>{% endif %}
             <a class="button-link secondary" href="{{ url_for('data_health_report') }}">Download Health Report</a>
+            {% if current_user and current_user.role == 'admin' %}<a class="button-link secondary" href="{{ url_for('data_recovery') }}">Data &amp; Recovery</a>{% endif %}
         </div>
-        {% if reliability.backups %}<div class="table-wrap" style="margin-top:16px;"><table class="history-table"><thead><tr><th>Backup</th><th>Size</th><th></th></tr></thead><tbody>{% for backup in reliability.backups %}<tr><td>{{ backup.name }}</td><td>{{ backup.size }}</td><td><form method="post" action="{{ url_for('restore_backup', filename=backup.name) }}" onsubmit="return confirm('Restore this backup? The current database will be backed up first.');"><button class="danger" type="submit">Restore</button></form></td></tr>{% endfor %}</tbody></table></div>{% endif %}
+        {% if not reliability.cloud_mode and reliability.backups %}<div class="table-wrap" style="margin-top:16px;"><table class="history-table"><thead><tr><th>Backup</th><th>Size</th><th></th></tr></thead><tbody>{% for backup in reliability.backups %}<tr><td>{{ backup.name }}</td><td>{{ backup.size }}</td><td><form method="post" action="{{ url_for('restore_backup', filename=backup.name) }}" onsubmit="return confirm('Restore this backup? The current database will be backed up first.');"><button class="danger" type="submit">Restore</button></form></td></tr>{% endfor %}</tbody></table></div>{% endif %}
         {% if reliability.recent_audit %}<h3 style="margin-top:24px;">Recent Activity</h3><div class="table-wrap"><table class="history-table"><thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead><tbody>{% for item in reliability.recent_audit %}<tr><td>{{ item.created_at }}</td><td>{{ item.event_type|replace('_',' ')|title }}</td><td>{{ item.detail }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
     </div>
     <div class="panel">
@@ -1819,7 +2735,7 @@ PAGE = r"""
             const close=c.customer_close_time?timeToMinutes(c.customer_close_time):defaultClose;
             return {open,close};
         }
-        function scheduleFromLegs(stops,legs,config,locksById){
+        function scheduleFromLegs(stops,legs,config,locksById,strictLocks=true){
             const lunchWindowStart=11*60, lunchLatestStart=12*60+30, lunchDuration=30;
             let cursor=config.repStart,totalVisit=0,totalWait=0,lunchTaken=false,lunchAt=null; const timings=[];
             for(let i=0;i<stops.length;i++){
@@ -1829,8 +2745,15 @@ PAGE = r"""
                 const duration=visitDuration(c);
                 if(lock){
                     const target=lock.timeMinutes;
-                    if(lock.kind==='locked' && cursor>target+0.5)return {fits:false,timings,finish:cursor,totalVisit,totalWait,reason:`Cannot reach ${c.name} by ${clock(target)}`};
-                    if(lock.kind==='locked'){arrival=target;locked=true;wait=Math.max(0,target-cursor);}
+                    if(lock.kind==='locked'){
+                        // Estimated travel is only used to search for a good insertion order. It can
+                        // overstate long-distance driving enough to reject a genuinely reachable fixed
+                        // appointment. Only the final road-routed schedule is allowed to reject a hard lock.
+                        if(strictLocks && cursor>target+0.5)return {fits:false,timings,finish:cursor,totalVisit,totalWait,failedLockId:Number(c.id),reason:`Cannot reach ${c.name} by ${clock(target)}`};
+                        if(cursor<=target+0.5){arrival=target;wait=Math.max(0,target-cursor);}
+                        else {arrival=Math.max(arrival,cursor);wait=Math.max(0,arrival-cursor);}
+                        locked=true;
+                    }
                     else if(cursor<=target) {arrival=Math.max(arrival,target);wait=Math.max(0,arrival-cursor);}
                 }
                 if(!lunchTaken){
@@ -1891,7 +2814,7 @@ PAGE = r"""
             return locks;
         }
         function estimatedLegs(stops,start,finish){const points=[start,...stops.map(c=>({lat:c.latitude,lng:c.longitude})),finish];return points.slice(1).map((p,i)=>{const km=haversine(points[i],p)*1.28;return {distance:km*1000,duration:(km/67)*3600};});}
-        function estimatedSchedule(stops,config,locksById,start,finish){return scheduleFromLegs(stops,estimatedLegs(stops,start,finish),config,locksById);}
+        function estimatedSchedule(stops,config,locksById,start,finish){return scheduleFromLegs(stops,estimatedLegs(stops,start,finish),config,locksById,false);}
         function bestInsertion(remaining,dayStops,config,locksById,start,finish,priorityFirst){
             let best=null;
             const candidates=[...remaining].sort((a,b)=>priorityFirst?urgencyRank(a)-urgencyRank(b):0);
@@ -1916,11 +2839,29 @@ PAGE = r"""
                 const finish=config.skipReturn?(dayStops.length?{lat:dayStops[dayStops.length-1].latitude,lng:dayStops[dayStops.length-1].longitude}:dayStart):(document.getElementById('same-end').checked?startPoint:endPoint);
                 while(remaining.length){const best=bestInsertion(remaining,dayStops,config,locksById,dayStart,finish,priorityFirst);if(!best)break;dayStops.splice(best.pos,0,best.candidate);remaining.splice(remaining.indexOf(best.candidate),1);}
                 if(!dayStops.length)continue;
-                let route=await routeDay(dayStops,dayStart,finish), schedule=scheduleFromLegs(dayStops,route.legs,config,locksById);
+                let route=await routeDay(dayStops,dayStart,finish), schedule=scheduleFromLegs(dayStops,route.legs,config,locksById,true);
+                let repairAttempts=0;
                 while(dayStops.length&&!schedule.fits){
+                    // If real road times show that a hard appointment is being reached late, first
+                    // move flexible calls from before that appointment to immediately after it. This
+                    // preserves the confirmed time instead of throwing away the rest of the day.
+                    if(schedule.failedLockId && repairAttempts<dayStops.length*2){
+                        const lockIndex=dayStops.findIndex(c=>Number(c.id)===Number(schedule.failedLockId));
+                        let moveIndex=-1;
+                        for(let i=lockIndex-1;i>=0;i--){if(!locksById.has(Number(dayStops[i].id))){moveIndex=i;break;}}
+                        if(moveIndex>=0){
+                            const [moved]=dayStops.splice(moveIndex,1);
+                            const refreshedLockIndex=dayStops.findIndex(c=>Number(c.id)===Number(schedule.failedLockId));
+                            dayStops.splice(refreshedLockIndex+1,0,moved);
+                            repairAttempts++;
+                            route=await routeDay(dayStops,dayStart,finish);
+                            schedule=scheduleFromLegs(dayStops,route.legs,config,locksById,true);
+                            continue;
+                        }
+                    }
                     let removeIndex=-1;for(let i=dayStops.length-1;i>=0;i--){if(!locksById.has(Number(dayStops[i].id))){removeIndex=i;break;}}
                     if(removeIndex<0)throw new Error(schedule.reason||`Locked appointments on Day ${dayIndex+1} cannot fit.`);
-                    const [removed]=dayStops.splice(removeIndex,1);remaining.unshift(removed);route=await routeDay(dayStops,dayStart,finish);schedule=scheduleFromLegs(dayStops,route.legs,config,locksById);
+                    const [removed]=dayStops.splice(removeIndex,1);remaining.unshift(removed);route=await routeDay(dayStops,dayStart,finish);schedule=scheduleFromLegs(dayStops,route.legs,config,locksById,true);
                 }
                 if(dayStops.length){built.push({stops:dayStops,...route,schedule,config,locksById,startPoint:{...dayStart},finishPoint:{...finish}});if(config.skipReturn){const last=dayStops[dayStops.length-1];dayStart={lat:last.latitude,lng:last.longitude,label:last.name};}}
             }
@@ -2371,6 +3312,8 @@ PAGE = r"""
     {% endif %}
 
     {% if view == 'customer_detail' %}
+    {% if success %}<div class="success">{{ success }}</div>{% endif %}
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <div class="panel">
         <div class="customer-hero">
             <div class="customer-hero-main">
@@ -2443,6 +3386,7 @@ PAGE = r"""
                 {% else %}<div class="empty">No contacts recorded yet.</div>{% endif %}
                 <form method="post" action="{{ url_for('add_customer_contact') }}" style="margin-top:14px;">
                     <input type="hidden" name="store_name" value="{{ customer.store_name }}">
+                    <input type="hidden" name="customer_id" value="{{ customer.route_customer_id or '' }}">
                     <div class="plan-form-grid"><label>Name<input type="text" name="contact_name" required></label><label>Role<input type="text" name="role"></label><label>Phone<input type="text" name="phone"></label><label>Email<input type="email" name="email"></label></div>
                     <label style="display:block;margin-top:10px;">Notes<textarea class="review-textarea" name="notes"></textarea></label><div class="button-row" style="text-align:left;"><button type="submit">Add Contact</button></div>
                 </form>
@@ -2451,6 +3395,26 @@ PAGE = r"""
                 <h2>Upcoming Visits</h2>
                 {% if upcoming_customer_visits %}{% for visit in upcoming_customer_visits %}<div class="customer-action-card"><strong>{{ visit.date_display }} · {{ visit.visit_time }}</strong><div class="small">{{ visit.trip_name }}</div>{% if visit.desired_outcome %}<div class="briefing-note"><strong>Desired outcome:</strong> {{ visit.desired_outcome }}</div>{% endif %}</div>{% endfor %}{% else %}<div class="empty">No upcoming planned visits.</div>{% endif %}
             </div>
+            {% if current_user and current_user.role == 'admin' and customer.route_customer_id %}
+            <div class="panel">
+                <div class="heading-row"><div><h2>Account Identity</h2><p>Admin-only. Renaming here keeps linked contacts, actions and history attached to this customer ID.</p></div></div>
+                <form method="post" action="{{ url_for('edit_customer_account', customer_id=customer.route_customer_id) }}" onsubmit="return confirm('Save these customer account changes?');">
+                    <div class="plan-form-grid">
+                        <label>Customer name<input type="text" name="name" value="{{ customer.store_name }}" required></label>
+                        <label>Customer group<input type="text" name="customer_group" value="{{ customer.customer_group }}"></label>
+                        <label>Street<input type="text" name="street" value="{{ customer.street }}"></label>
+                        <label>City<input type="text" name="city" value="{{ customer.city }}"></label>
+                        <label>ZIP<input type="text" name="zip" value="{{ customer.zip }}"></label>
+                        <label>Phone<input type="text" name="phone" value="{{ customer.phone }}"></label>
+                        <label>Email<input type="email" name="email" value="{{ customer.email }}"></label>
+                        <label>Tier<select name="priority_tier">{% for tier in ['A','B','C','D'] %}<option value="{{ tier }}" {% if customer.priority_tier == tier %}selected{% endif %}>{{ tier }}</option>{% endfor %}</select></label>
+                        <label>Call cycle days<input type="number" min="1" name="call_interval" value="{{ customer.visit_frequency_days }}"></label>
+                        <label>Call duration minutes<input type="number" min="10" name="ideal_call_minutes" value="{{ customer.ideal_call_minutes }}"></label>
+                    </div>
+                    <div class="button-row" style="text-align:left;"><button type="submit">Save Account Identity</button></div>
+                </form>
+            </div>
+            {% endif %}
             <div class="panel">
                 <h2>Customer Settings</h2>
                 <form method="post" action="{{ url_for('customer_priorities') }}">
@@ -2483,6 +3447,34 @@ PAGE = r"""
             </div>
             {% endfor %}
         {% else %}<div class="empty">No call history has been recorded yet.</div>{% endif %}
+    </div>
+    {% endif %}
+
+    {% if view == 'team_dashboard' %}
+    <div class="panel">
+        <div class="heading-row"><div><h2>Team Overview</h2><p>Live roll-up of each active Sales Rep. Territory and workspace data remain private to the rep; managers see this summary view.</p></div></div>
+        <div class="priority-summary">
+            <div class="summary-card positive"><div class="label">Sales Reps</div><div class="value">{{ team_totals.reps }}</div><div class="note">Active rep accounts</div></div>
+            <div class="summary-card"><div class="label">Assigned Customers</div><div class="value">{{ team_totals.customers }}</div><div class="note">Across all rep territories</div></div>
+            <div class="summary-card warning"><div class="label">Overdue Customers</div><div class="value">{{ team_totals.overdue_customers }}</div><div class="note">{{ team_totals.overdue_a }} are Tier A</div></div>
+            <div class="summary-card neutral"><div class="label">Overdue Actions</div><div class="value">{{ team_totals.overdue_actions }}</div><div class="note">Open and past due · {{ team_totals.calls_month }} calls this month</div></div>
+        </div>
+    </div>
+    <div class="panel">
+        <div class="heading-row"><div><h2>Rep Performance & Coverage</h2><p>Use this as the manager's starting point. Rep-entered performance records are still isolated in each rep account.</p></div></div>
+        {% if team_rows %}
+        <div class="table-wrap"><table class="finder-table"><thead><tr><th>Rep</th><th>Territory</th><th>Calls</th><th>Actions</th><th>Checklist</th><th>Bonus activity</th><th>Trips</th></tr></thead><tbody>
+        {% for rep in team_rows %}<tr>
+            <td><strong>{{ rep.display_name }}</strong><br><span class="small">{{ rep.email }}</span></td>
+            <td><strong>{{ rep.customer_count }}</strong> customers · <strong>{{ rep.coverage_percent }}%</strong> in cycle<br><span class="small"><a href="{{ url_for('manage_territories', rep=rep.id, status='overdue') }}">{{ rep.overdue_customers }} overdue</a> · <a href="{{ url_for('manage_territories', rep=rep.id, status='overdue_a') }}">{{ rep.overdue_a }} overdue Tier A</a> · <a href="{{ url_for('manage_territories', rep=rep.id, status='stale90') }}">{{ rep.stale90 }} at 90+ days</a></span>{% if rep.attention %}<div class="small" style="margin-top:6px"><strong>Needs attention:</strong> {% for item in rep.attention %}<a href="{{ url_for('customer_detail_by_id', customer_id=item.id) }}">{{ item.name }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</div>{% endif %}</td>
+            <td><strong>{{ rep.calls_month }}</strong> this month<br><span class="small">{{ rep.calls_week }} this week</span></td>
+            <td><strong>{{ rep.open_actions }}</strong> open<br><span class="small">{{ rep.overdue_actions }} overdue · {{ rep.high_actions }} high priority</span></td>
+            <td><strong>{{ rep.checklist_done }}/{{ rep.checklist_total }}</strong><br><span class="small">{{ rep.checklist_percent }}% complete this week</span></td>
+            <td><strong>{{ rep.bonus_qtd_display }}</strong><br><span class="small">Current-quarter uploaded transactions</span></td>
+            <td>{% if rep.next_trip %}<strong>{{ rep.next_trip.trip_name }}</strong><br><span class="small">{{ rep.next_trip.start_date }} · {{ rep.next_trip.destination or 'No destination' }}</span>{% else %}<span class="small">No upcoming trip</span>{% endif %}<br><span class="small">{{ rep.upcoming_trip_count }} upcoming</span></td>
+        </tr>{% endfor %}
+        </tbody></table></div>
+        {% else %}<div class="empty">No active Sales Rep accounts yet.</div>{% endif %}
     </div>
     {% endif %}
 
@@ -2528,7 +3520,7 @@ PAGE = r"""
             {% for row in priority_rows %}
             <tr>
                 <td><strong>{{ loop.index }}</strong></td>
-                <td><a class="customer-link" href="{{ url_for('customer_detail', store_name=row.store_name) }}">{{ row.store_name }}</a><br><span class="small">{{ row.customer_group }}{% if row.address_display %} · {{ row.address_display }}{% endif %}</span>{% if row.strategic_notes %}<br><span class="small">{{ row.strategic_notes }}</span>{% elif row.call_note %}<br><span class="small">{{ row.call_note }}</span>{% endif %}</td>
+                <td><a class="customer-link" href="{{ url_for('customer_detail_by_id', customer_id=row.route_customer_id) if row.route_customer_id else url_for('customer_detail', store_name=row.store_name) }}">{{ row.store_name }}</a><br><span class="small">{{ row.customer_group }}{% if row.address_display %} · {{ row.address_display }}{% endif %}</span>{% if row.strategic_notes %}<br><span class="small">{{ row.strategic_notes }}</span>{% elif row.call_note %}<br><span class="small">{{ row.call_note }}</span>{% endif %}</td>
                 <td><span class="priority-class priority-{{ row.class_key }}">{{ row.classification }}</span></td>
                 <td><span class="priority-score">{{ row.score }}</span><div class="score-breakdown">{{ row.score_breakdown }}</div></td>
                 <td>
@@ -2618,7 +3610,7 @@ PAGE = r"""
                 <div class="upload-box">
                     <h3>Salesperson</h3>
                     <p>Enter the rep's name exactly as you'd like it saved (the report itself doesn't contain a name column).</p>
-                    <input type="text" name="salesperson" placeholder="e.g. Ted Suckling" list="known_salespeople" value="{{ selected_salesperson }}" required>
+                    <input type="text" name="salesperson" placeholder="e.g. Ted Suckling" list="known_salespeople" value="{{ selected_salesperson }}" {% if current_user and current_user.role == 'sales_rep' %}readonly{% endif %} required>
                     <datalist id="known_salespeople">
                         {% for name in salesperson_options %}<option value="{{ name }}">{% endfor %}
                     </datalist>
@@ -3878,7 +4870,7 @@ def action_display_row(record):
     return row
 
 def init_database():
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS monthly_sales (
@@ -3902,6 +4894,7 @@ def init_database():
                 sheds_current REAL NOT NULL,
                 sheds_previous REAL NOT NULL,
                 saved_at TEXT NOT NULL,
+                owner_user_id INTEGER,
                 UNIQUE(salesperson, year, month)
             )
             """
@@ -3913,7 +4906,8 @@ def init_database():
                 store_name TEXT NOT NULL UNIQUE,
                 export_date TEXT NOT NULL,
                 analysis_json TEXT NOT NULL,
-                saved_at TEXT NOT NULL
+                saved_at TEXT NOT NULL,
+                owner_user_id INTEGER
             )
             """
         )
@@ -3951,7 +4945,8 @@ def init_database():
                 status TEXT NOT NULL DEFAULT 'Open',
                 notes TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                owner_user_id INTEGER
             )
             """
         )
@@ -4080,6 +5075,7 @@ def init_database():
                 amount REAL NOT NULL,
                 source_filename TEXT NOT NULL,
                 uploaded_at TEXT NOT NULL,
+                owner_user_id INTEGER,
                 UNIQUE(salesperson, doc_number)
             )
             """
@@ -4576,47 +5572,52 @@ def save_month():
     values = {field: request.form[field] for field in required_fields}
     saved_at = datetime.now().isoformat(timespec="seconds")
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.execute(
-            """
-            INSERT INTO monthly_sales (
-                salesperson, year, month, as_of_date, current_filename,
-                previous_filename, current_total, previous_total,
-                armorsteel_current, armorsteel_previous, greens_current,
-                greens_previous, lifestyle_current, lifestyle_previous,
-                nzwb_current, nzwb_previous, sheds_current, sheds_previous,
-                saved_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(salesperson, year, month) DO UPDATE SET
-                as_of_date=excluded.as_of_date,
-                current_filename=excluded.current_filename,
-                previous_filename=excluded.previous_filename,
-                current_total=excluded.current_total,
-                previous_total=excluded.previous_total,
-                armorsteel_current=excluded.armorsteel_current,
-                armorsteel_previous=excluded.armorsteel_previous,
-                greens_current=excluded.greens_current,
-                greens_previous=excluded.greens_previous,
-                lifestyle_current=excluded.lifestyle_current,
-                lifestyle_previous=excluded.lifestyle_previous,
-                nzwb_current=excluded.nzwb_current,
-                nzwb_previous=excluded.nzwb_previous,
-                sheds_current=excluded.sheds_current,
-                sheds_previous=excluded.sheds_previous,
-                saved_at=excluded.saved_at
-            """,
-            (
-                values["salesperson"], int(values["year"]), int(values["month"]),
-                values["as_of_date"], values["current_filename"], values["previous_filename"],
-                float(values["current_total"]), float(values["previous_total"]),
-                float(values["armorsteel_current"]), float(values["armorsteel_previous"]),
-                float(values["greens_current"]), float(values["greens_previous"]),
-                float(values["lifestyle_current"]), float(values["lifestyle_previous"]),
-                float(values["nzwb_current"]), float(values["nzwb_previous"]),
-                float(values["sheds_current"]), float(values["sheds_previous"]),
-                saved_at,
-            ),
+    owner_user_id = _private_performance_user_id()
+    if owner_user_id is not None:
+        values["salesperson"] = _private_performance_name()
+
+    with db_connect() as connection:
+        if owner_user_id is not None:
+            existing = connection.execute(
+                "SELECT id FROM monthly_sales WHERE owner_user_id=? AND year=? AND month=?",
+                (owner_user_id, int(values["year"]), int(values["month"])),
+            ).fetchone()
+        else:
+            existing = connection.execute(
+                "SELECT id FROM monthly_sales WHERE owner_user_id IS NULL AND lower(trim(salesperson))=lower(trim(?)) AND year=? AND month=?",
+                (values["salesperson"], int(values["year"]), int(values["month"])),
+            ).fetchone()
+
+        payload = (
+            values["salesperson"], int(values["year"]), int(values["month"]),
+            values["as_of_date"], values["current_filename"], values["previous_filename"],
+            float(values["current_total"]), float(values["previous_total"]),
+            float(values["armorsteel_current"]), float(values["armorsteel_previous"]),
+            float(values["greens_current"]), float(values["greens_previous"]),
+            float(values["lifestyle_current"]), float(values["lifestyle_previous"]),
+            float(values["nzwb_current"]), float(values["nzwb_previous"]),
+            float(values["sheds_current"]), float(values["sheds_previous"]), saved_at, owner_user_id,
         )
+        if existing:
+            connection.execute(
+                """
+                UPDATE monthly_sales SET salesperson=?, year=?, month=?, as_of_date=?, current_filename=?,
+                    previous_filename=?, current_total=?, previous_total=?, armorsteel_current=?, armorsteel_previous=?,
+                    greens_current=?, greens_previous=?, lifestyle_current=?, lifestyle_previous=?,
+                    nzwb_current=?, nzwb_previous=?, sheds_current=?, sheds_previous=?, saved_at=?, owner_user_id=?
+                WHERE id=?
+                """,
+                payload + (existing[0],),
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO monthly_sales (salesperson,year,month,as_of_date,current_filename,previous_filename,
+                    current_total,previous_total,armorsteel_current,armorsteel_previous,greens_current,greens_previous,
+                    lifestyle_current,lifestyle_previous,nzwb_current,nzwb_previous,sheds_current,sheds_previous,saved_at,owner_user_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, payload,
+            )
         connection.commit()
 
     return redirect(url_for("history", year=values["year"], success="Month saved successfully."))
@@ -4626,11 +5627,13 @@ def save_month():
 def qtr_bonus_tracker():
     error = request.args.get("error")
     success = request.args.get("success")
-    selected_salesperson = request.args.get("salesperson", "").strip()
+    owner_user_id = _private_performance_user_id()
+    private_name = _private_performance_name()
+    selected_salesperson = private_name if owner_user_id is not None else request.args.get("salesperson", "").strip()
 
     if request.method == "POST":
         uploaded_file = request.files.get("transactions_report")
-        form_salesperson = request.form.get("salesperson", "").strip()
+        form_salesperson = private_name if owner_user_id is not None else request.form.get("salesperson", "").strip()
         if not uploaded_file or not uploaded_file.filename:
             error = "Please choose a transactions report file."
         elif not form_salesperson:
@@ -4639,37 +5642,44 @@ def qtr_bonus_tracker():
             try:
                 transactions = read_rep_transactions_report(uploaded_file)
                 uploaded_at = datetime.now().isoformat(timespec="seconds")
-                with sqlite3.connect(DATABASE_PATH) as connection:
+                with db_connect() as connection:
                     for txn in transactions:
-                        connection.execute(
-                            """
-                            INSERT INTO rep_bonus_transactions (
-                                salesperson, doc_number, txn_date, amount, source_filename, uploaded_at
-                            ) VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(salesperson, doc_number) DO UPDATE SET
-                                txn_date=excluded.txn_date,
-                                amount=excluded.amount,
-                                source_filename=excluded.source_filename,
-                                uploaded_at=excluded.uploaded_at
-                            """,
-                            (
-                                form_salesperson, txn["doc_number"], txn["date"].isoformat(),
-                                txn["amount"], uploaded_file.filename, uploaded_at,
-                            ),
-                        )
+                        if owner_user_id is not None:
+                            existing = connection.execute(
+                                "SELECT id FROM rep_bonus_transactions WHERE owner_user_id=? AND doc_number=?",
+                                (owner_user_id, txn["doc_number"]),
+                            ).fetchone()
+                        else:
+                            existing = connection.execute(
+                                "SELECT id FROM rep_bonus_transactions WHERE owner_user_id IS NULL AND lower(trim(salesperson))=lower(trim(?)) AND doc_number=?",
+                                (form_salesperson, txn["doc_number"]),
+                            ).fetchone()
+                        if existing:
+                            connection.execute(
+                                "UPDATE rep_bonus_transactions SET salesperson=?,txn_date=?,amount=?,source_filename=?,uploaded_at=?,owner_user_id=? WHERE id=?",
+                                (form_salesperson, txn["date"].isoformat(), txn["amount"], uploaded_file.filename, uploaded_at, owner_user_id, existing[0]),
+                            )
+                        else:
+                            connection.execute(
+                                "INSERT INTO rep_bonus_transactions (salesperson,doc_number,txn_date,amount,source_filename,uploaded_at,owner_user_id) VALUES (?,?,?,?,?,?,?)",
+                                (form_salesperson, txn["doc_number"], txn["date"].isoformat(), txn["amount"], uploaded_file.filename, uploaded_at, owner_user_id),
+                            )
                     connection.commit()
                 selected_salesperson = form_salesperson
                 success = f"Loaded {len(transactions)} transactions for {form_salesperson}."
             except Exception as exc:
                 error = f"The report could not be processed. Details: {exc}"
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        salesperson_options = [
-            row["salesperson"] for row in connection.execute(
-                "SELECT DISTINCT salesperson FROM rep_bonus_transactions ORDER BY salesperson"
-            ).fetchall()
-        ]
+        if owner_user_id is not None:
+            salesperson_options = [private_name]
+        else:
+            salesperson_options = [
+                row["salesperson"] for row in connection.execute(
+                    "SELECT DISTINCT salesperson FROM rep_bonus_transactions ORDER BY salesperson"
+                ).fetchall()
+            ]
 
     if not selected_salesperson and salesperson_options:
         selected_salesperson = salesperson_options[0]
@@ -4697,11 +5707,17 @@ def qtr_bonus_tracker():
     }
 
     if selected_salesperson:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            rows = connection.execute(
-                "SELECT txn_date, amount FROM rep_bonus_transactions WHERE salesperson = ?",
-                (selected_salesperson,),
-            ).fetchall()
+        with db_connect() as connection:
+            if owner_user_id is not None:
+                rows = connection.execute(
+                    "SELECT txn_date, amount FROM rep_bonus_transactions WHERE owner_user_id=?",
+                    (owner_user_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT txn_date, amount FROM rep_bonus_transactions WHERE salesperson = ?",
+                    (selected_salesperson,),
+                ).fetchall()
         transactions = [(date.fromisoformat(row[0]), row[1]) for row in rows]
 
         if transactions:
@@ -4786,11 +5802,17 @@ def qtr_bonus_tracker():
 
 @app.route("/history")
 def history():
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        year_rows = connection.execute(
-            "SELECT DISTINCT year FROM monthly_sales ORDER BY year DESC"
-        ).fetchall()
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            year_rows = connection.execute(
+                "SELECT DISTINCT year FROM monthly_sales WHERE owner_user_id=? ORDER BY year DESC", (owner_user_id,)
+            ).fetchall()
+        else:
+            year_rows = connection.execute(
+                "SELECT DISTINCT year FROM monthly_sales ORDER BY year DESC"
+            ).fetchall()
 
         year_options = [row["year"] for row in year_rows]
         if not year_options:
@@ -4801,14 +5823,16 @@ def history():
         except ValueError:
             selected_year = year_options[0]
 
-        records = connection.execute(
-            """
-            SELECT * FROM monthly_sales
-            WHERE year = ?
-            ORDER BY month
-            """,
-            (selected_year,),
-        ).fetchall()
+        if owner_user_id is not None:
+            records = connection.execute(
+                "SELECT * FROM monthly_sales WHERE year=? AND owner_user_id=? ORDER BY month",
+                (selected_year, owner_user_id),
+            ).fetchall()
+        else:
+            records = connection.execute(
+                "SELECT * FROM monthly_sales WHERE year=? ORDER BY month",
+                (selected_year,),
+            ).fetchall()
 
     history_rows = []
     ytd_actual = 0.0
@@ -4896,12 +5920,17 @@ def history():
 
 @app.route("/month/<int:record_id>")
 def saved_month(record_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        record = connection.execute(
-            "SELECT * FROM monthly_sales WHERE id = ?",
-            (record_id,),
-        ).fetchone()
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            record = connection.execute(
+                "SELECT * FROM monthly_sales WHERE id=? AND owner_user_id=?", (record_id, owner_user_id)
+            ).fetchone()
+        else:
+            record = connection.execute(
+                "SELECT * FROM monthly_sales WHERE id=?", (record_id,)
+            ).fetchone()
 
     if record is None:
         return redirect(url_for("history", error="That saved month could not be found."))
@@ -5823,10 +6852,17 @@ def normalise_action_key(store, title):
 
 def mark_existing_action_duplicates(items):
     """Mark suggestions already present as an incomplete action."""
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        existing_rows = connection.execute(
-            "SELECT store_name, title FROM store_actions WHERE status != 'Completed'"
-        ).fetchall()
+    with db_connect() as connection:
+        owner_user_id = _private_workspace_user_id()
+        if owner_user_id is not None:
+            existing_rows = connection.execute(
+                "SELECT store_name, title FROM store_actions WHERE status != 'Completed' AND owner_user_id=?",
+                (owner_user_id,),
+            ).fetchall()
+        else:
+            existing_rows = connection.execute(
+                "SELECT store_name, title FROM store_actions WHERE status != 'Completed'"
+            ).fetchall()
 
     existing_keys = {
         normalise_action_key(store_name, title)
@@ -5848,7 +6884,7 @@ def follow_up():
     active_trip = None
     active_trip_id = request.values.get("trip_id", type=int)
     after_trip_summary = {"total_visits": 0, "completed_visits": 0, "pending_visits": 0, "notes_captured": 0, "actions_today": 0}
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
         if active_trip_id:
             active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (active_trip_id,)).fetchone()
@@ -5904,9 +6940,16 @@ def follow_up():
             after_trip_visits.sort(key=lambda row: (row["date_iso"], row["visit_time"]), reverse=True)
             after_trip_visits = after_trip_visits[:50]
         today_prefix = date.today().isoformat()
-        after_trip_summary["actions_today"] = connection.execute(
-            "SELECT COUNT(*) FROM store_actions WHERE created_at LIKE ?", (today_prefix + "%",)
-        ).fetchone()[0]
+        owner_user_id = _private_workspace_user_id()
+        if owner_user_id is not None:
+            after_trip_summary["actions_today"] = connection.execute(
+                "SELECT COUNT(*) FROM store_actions WHERE created_at LIKE ? AND owner_user_id=?",
+                (today_prefix + "%", owner_user_id),
+            ).fetchone()[0]
+        else:
+            after_trip_summary["actions_today"] = connection.execute(
+                "SELECT COUNT(*) FROM store_actions WHERE created_at LIKE ?", (today_prefix + "%",)
+            ).fetchone()[0]
     after_trip_summary["pending_visits"] = max(after_trip_summary["total_visits"] - after_trip_summary["completed_visits"], 0)
     if request.args.get("load_road_notes") == "1":
         blocks = []
@@ -5933,7 +6976,7 @@ def follow_up():
                     schedule_html = schedule_bytes.decode("windows-1252", errors="replace")
 
                 if "<html" in schedule_html.lower() and "portatour" in schedule_html.lower():
-                    with sqlite3.connect(DATABASE_PATH) as connection:
+                    with db_connect() as connection:
                         connection.execute(
                             "INSERT INTO trip_schedules (filename, raw_html, uploaded_at) VALUES (?, ?, ?)",
                             (
@@ -5988,10 +7031,17 @@ def save_followups():
     skipped_duplicates = 0
     extracted = []
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        existing_rows = connection.execute(
-            "SELECT store_name, title FROM store_actions WHERE status != 'Completed'"
-        ).fetchall()
+    with db_connect() as connection:
+        owner_user_id = _private_workspace_user_id()
+        if owner_user_id is not None:
+            existing_rows = connection.execute(
+                "SELECT store_name, title FROM store_actions WHERE status != 'Completed' AND owner_user_id=?",
+                (owner_user_id,),
+            ).fetchall()
+        else:
+            existing_rows = connection.execute(
+                "SELECT store_name, title FROM store_actions WHERE status != 'Completed'"
+            ).fetchall()
         existing_keys = {
             normalise_action_key(store_name, title)
             for store_name, title in existing_rows
@@ -6025,9 +7075,9 @@ def save_followups():
 
             connection.execute(
                 "INSERT INTO store_actions "
-                "(store_name,title,detail,source,priority,due_date,status,notes,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (store, title, detail, source, priority, due_date, "Open", "", now, now),
+                "(store_name,title,detail,source,priority,due_date,status,notes,created_at,updated_at,owner_user_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (store, title, detail, source, priority, due_date, "Open", "", now, now, owner_user_id),
             )
             existing_keys.add(key)
             extracted.append({
@@ -6062,7 +7112,13 @@ ACTION_STATUSES = ["Open", "In Progress", "Waiting on Store", "Completed"]
 
 
 def get_open_action_count():
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
+        owner_user_id = _private_workspace_user_id()
+        if owner_user_id is not None:
+            return connection.execute(
+                "SELECT COUNT(*) FROM store_actions WHERE status != 'Completed' AND owner_user_id=?",
+                (owner_user_id,),
+            ).fetchone()[0]
         return connection.execute("SELECT COUNT(*) FROM store_actions WHERE status != 'Completed'").fetchone()[0]
 
 
@@ -6184,21 +7240,28 @@ def save_opportunity():
         return redirect(url_for("opportunities", error=f"The store analysis could not be saved. Details: {exc}"))
 
     saved_at = datetime.now().isoformat(timespec="seconds")
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         # Replace the existing store analysis regardless of capitalisation or extra spaces.
-        matches = connection.execute(
-            "SELECT id FROM opportunity_analyses WHERE lower(trim(store_name)) = lower(trim(?)) ORDER BY id",
-            (store_name,),
-        ).fetchall()
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            matches = connection.execute(
+                "SELECT id FROM opportunity_analyses WHERE owner_user_id=? AND lower(trim(store_name))=lower(trim(?)) ORDER BY id",
+                (owner_user_id, store_name),
+            ).fetchall()
+        else:
+            matches = connection.execute(
+                "SELECT id FROM opportunity_analyses WHERE owner_user_id IS NULL AND lower(trim(store_name))=lower(trim(?)) ORDER BY id",
+                (store_name,),
+            ).fetchall()
         if matches:
             keep_id = matches[0][0]
             connection.execute(
                 """
                 UPDATE opportunity_analyses
-                SET store_name = ?, export_date = ?, analysis_json = ?, saved_at = ?
+                SET store_name = ?, customer_id = ?, export_date = ?, analysis_json = ?, saved_at = ?, owner_user_id = ?
                 WHERE id = ?
                 """,
-                (store_name, export_date, json.dumps(analysis), saved_at, keep_id),
+                (store_name, _resolve_customer_id(connection, store_name), export_date, json.dumps(analysis), saved_at, owner_user_id, keep_id),
             )
             if len(matches) > 1:
                 duplicate_ids = [row[0] for row in matches[1:]]
@@ -6210,10 +7273,10 @@ def save_opportunity():
         else:
             connection.execute(
                 """
-                INSERT INTO opportunity_analyses (store_name, export_date, analysis_json, saved_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO opportunity_analyses (store_name, customer_id, export_date, analysis_json, saved_at, owner_user_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (store_name, export_date, json.dumps(analysis), saved_at),
+                (store_name, _resolve_customer_id(connection, store_name), export_date, json.dumps(analysis), saved_at, owner_user_id),
             )
         connection.commit()
     return redirect(url_for("opportunity_library", success=f"{store_name} was saved successfully."))
@@ -6221,11 +7284,17 @@ def save_opportunity():
 
 @app.route("/opportunity-library")
 def opportunity_library():
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        records = connection.execute(
-            "SELECT * FROM opportunity_analyses ORDER BY store_name COLLATE NOCASE"
-        ).fetchall()
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            records = connection.execute(
+                "SELECT * FROM opportunity_analyses WHERE owner_user_id=? ORDER BY store_name COLLATE NOCASE", (owner_user_id,)
+            ).fetchall()
+        else:
+            records = connection.execute(
+                "SELECT * FROM opportunity_analyses ORDER BY store_name COLLATE NOCASE"
+            ).fetchall()
     store_rows = []
     for record in records:
         try:
@@ -6254,11 +7323,17 @@ def opportunity_library():
 
 
 def load_saved_opportunity(analysis_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        record = connection.execute(
-            "SELECT * FROM opportunity_analyses WHERE id = ?", (analysis_id,)
-        ).fetchone()
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            record = connection.execute(
+                "SELECT * FROM opportunity_analyses WHERE id=? AND owner_user_id=?", (analysis_id, owner_user_id)
+            ).fetchone()
+        else:
+            record = connection.execute(
+                "SELECT * FROM opportunity_analyses WHERE id=?", (analysis_id,)
+            ).fetchone()
     if record is None:
         return None, None
     try:
@@ -6413,15 +7488,22 @@ def trip_prep():
     success = request.args.get("success")
     should_generate = request.args.get("generate") == "1"
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
         requested_id = request.args.get("trip", type=int)
+        owner_user_id = _trip_owner_user_id()
         if requested_id:
-            trip_plan = connection.execute("SELECT * FROM trip_plans WHERE id=?", (requested_id,)).fetchone()
-            latest_schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (requested_id,)).fetchone()
+            trip_plan = _trip_row_for_current_user(connection, requested_id)
+            if requested_id and trip_plan is None and owner_user_id is not None:
+                abort(403)
+            latest_schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (requested_id,)).fetchone() if trip_plan else None
         else:
-            trip_plan = connection.execute("SELECT * FROM trip_plans ORDER BY start_date DESC, id DESC LIMIT 1").fetchone()
-            latest_schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
+            if owner_user_id is not None:
+                trip_plan = connection.execute("SELECT * FROM trip_plans WHERE owner_user_id=? ORDER BY start_date DESC, id DESC LIMIT 1", (owner_user_id,)).fetchone()
+                latest_schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (trip_plan["id"],)).fetchone() if trip_plan else connection.execute("SELECT * FROM trip_schedules WHERE owner_user_id=? AND trip_plan_id IS NULL ORDER BY id DESC LIMIT 1", (owner_user_id,)).fetchone()
+            else:
+                trip_plan = connection.execute("SELECT * FROM trip_plans ORDER BY start_date DESC, id DESC LIMIT 1").fetchone()
+                latest_schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
 
     if request.method == "POST":
         action = request.form.get("action", "generate")
@@ -6439,11 +7521,14 @@ def trip_prep():
             else:
                 values=(name, request.form.get("destination", "").strip(), start_date, end_date, request.form.get("travel_method", "Drive"), request.form.get("notes", "").strip(), now)
                 plan_id=request.form.get("trip_plan_id", type=int)
-                with sqlite3.connect(DATABASE_PATH) as connection:
+                with db_connect() as connection:
+                    owner_user_id = _trip_owner_user_id()
                     if plan_id:
+                        if owner_user_id is not None and not _trip_row_for_current_user(connection, plan_id):
+                            abort(403)
                         connection.execute("UPDATE trip_plans SET trip_name=?,destination=?,start_date=?,end_date=?,travel_method=?,notes=?,updated_at=? WHERE id=?", values+(plan_id,))
                     else:
-                        cur=connection.execute("INSERT INTO trip_plans (trip_name,destination,start_date,end_date,travel_method,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", values[:-1]+(now,now))
+                        cur=connection.execute("INSERT INTO trip_plans (trip_name,destination,start_date,end_date,travel_method,notes,created_at,updated_at,owner_user_id) VALUES (?,?,?,?,?,?,?,?,?)", values[:-1]+(now,now,owner_user_id))
                         plan_id=cur.lastrowid
                     connection.commit()
                 return redirect(url_for("trip_prep", trip=plan_id, success="Trip details saved."))
@@ -6454,7 +7539,8 @@ def trip_prep():
             if not appointment_id:
                 error="The appointment could not be identified."
             else:
-                with sqlite3.connect(DATABASE_PATH) as connection:
+                with db_connect() as connection:
+                    if plan_id and _trip_owner_user_id() is not None and not _trip_row_for_current_user(connection, plan_id): abort(403)
                     connection.execute("""INSERT INTO appointment_objectives (appointment_id,trip_plan_id,schedule_id,visit_date,visit_time,store_name,desired_outcome,preparation_notes,updated_at)
                     VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(appointment_id) DO UPDATE SET desired_outcome=excluded.desired_outcome,preparation_notes=excluded.preparation_notes,store_name=excluded.store_name,visit_date=excluded.visit_date,visit_time=excluded.visit_time,updated_at=excluded.updated_at""",
                     (appointment_id,plan_id,request.form.get("schedule_id",type=int) or 0,request.form.get("visit_date",""),request.form.get("visit_time",""),request.form.get("store_name","").strip(),request.form.get("desired_outcome","").strip(),request.form.get("preparation_notes","").strip(),now))
@@ -6467,7 +7553,8 @@ def trip_prep():
                 error="Save the trip details before recording travel."
             else:
                 confirmed=1 if request.form.get("travel_confirmed") else 0
-                with sqlite3.connect(DATABASE_PATH) as connection:
+                with db_connect() as connection:
+                    if _trip_owner_user_id() is not None and not _trip_row_for_current_user(connection, plan_id): abort(403)
                     connection.execute("UPDATE trip_plans SET flight_status=?,rental_status=?,accommodation_status=?,travel_notes=?,travel_confirmed=?,updated_at=? WHERE id=?", (request.form.get("flight_status","Not Required"),request.form.get("rental_status","Not Required"),request.form.get("accommodation_status","Not Required"),request.form.get("travel_notes","").strip(),confirmed,now,plan_id))
                     connection.commit()
                 return redirect(url_for("trip_prep", trip=plan_id, success="Travel arrangements saved."))
@@ -6477,7 +7564,8 @@ def trip_prep():
             if plan_id:
                 fields=["appointments_confirmed","brochures_packed","samples_packed","briefs_reviewed"]
                 vals=[1 if request.form.get("ready_"+f) else 0 for f in fields]
-                with sqlite3.connect(DATABASE_PATH) as connection:
+                with db_connect() as connection:
+                    if _trip_owner_user_id() is not None and not _trip_row_for_current_user(connection, plan_id): abort(403)
                     connection.execute("UPDATE trip_plans SET appointments_confirmed=?,brochures_packed=?,samples_packed=?,briefs_reviewed=?,updated_at=? WHERE id=?", (*vals,now,plan_id))
                     connection.commit()
                 return redirect(url_for("trip_prep", trip=plan_id, success="Readiness checklist saved."))
@@ -6492,8 +7580,9 @@ def trip_prep():
                 if "<html" not in html_text.lower() or "portatour" not in html_text.lower():
                     error="That file does not appear to be a Portatour HTML report."
                 else:
-                    with sqlite3.connect(DATABASE_PATH) as connection:
-                        cur=connection.execute("INSERT INTO trip_schedules (filename,raw_html,uploaded_at) VALUES (?,?,?)",(uploaded.filename,html_text,now)); connection.commit(); sid=cur.lastrowid
+                    with db_connect() as connection:
+                        current_plan_id = int(trip_plan["id"]) if trip_plan else None
+                        cur=connection.execute("INSERT INTO trip_schedules (filename,raw_html,uploaded_at,trip_plan_id,owner_user_id) VALUES (?,?,?,?,?)",(uploaded.filename,html_text,now,current_plan_id,_trip_owner_user_id())); connection.commit(); sid=cur.lastrowid
                         connection.row_factory=sqlite3.Row; latest_schedule=connection.execute("SELECT * FROM trip_schedules WHERE id=?",(sid,)).fetchone()
                     should_generate=True; success=f"{uploaded.filename} uploaded and appointments loaded."
         else:
@@ -6503,7 +7592,7 @@ def trip_prep():
     if latest_schedule is not None:
         raw_appointments=parse_schedule_appointments(latest_schedule["raw_html"], today)
         objective_map={}
-        with sqlite3.connect(DATABASE_PATH) as connection:
+        with db_connect() as connection:
             connection.row_factory=sqlite3.Row
             for row in connection.execute("SELECT * FROM appointment_objectives WHERE schedule_id=?",(latest_schedule["id"],)).fetchall(): objective_map[row["appointment_id"]]=dict(row)
         plan_for_id=(trip_plan["id"] if trip_plan else 0)
@@ -6524,10 +7613,16 @@ def trip_prep():
     if request.method=="POST" and request.form.get("action")=="download_pdf" and prep_rows and not error:
         return build_packing_pdf(prep_rows, latest_schedule["filename"] if latest_schedule else None)
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
         plan_id=request.args.get("trip", type=int)
-        trip_plan=connection.execute("SELECT * FROM trip_plans WHERE id=?",(plan_id,)).fetchone() if plan_id else connection.execute("SELECT * FROM trip_plans ORDER BY start_date DESC,id DESC LIMIT 1").fetchone()
+        owner_user_id = _trip_owner_user_id()
+        if plan_id:
+            trip_plan = _trip_row_for_current_user(connection, plan_id)
+        elif owner_user_id is not None:
+            trip_plan = connection.execute("SELECT * FROM trip_plans WHERE owner_user_id=? ORDER BY start_date DESC,id DESC LIMIT 1", (owner_user_id,)).fetchone()
+        else:
+            trip_plan = connection.execute("SELECT * FROM trip_plans ORDER BY start_date DESC,id DESC LIMIT 1").fetchone()
     default_plan={"id":None,"trip_name":"","destination":"","start_date":today.isoformat(),"end_date":today.isoformat(),"travel_method":"Drive","notes":"","flight_status":"Not Required","rental_status":"Not Required","accommodation_status":"Not Required","travel_notes":"","travel_confirmed":0,"appointments_confirmed":0,"brochures_packed":0,"samples_packed":0,"briefs_reviewed":0}
     plan=dict(trip_plan) if trip_plan else default_plan
     ready_items=[{"key":"appointments_confirmed","label":"Appointments confirmed","done":bool(plan.get("appointments_confirmed"))},{"key":"brochures_packed","label":"Brochures packed","done":bool(plan.get("brochures_packed"))},{"key":"samples_packed","label":"Samples and tools packed","done":bool(plan.get("samples_packed"))},{"key":"briefs_reviewed","label":"Customer briefs reviewed","done":bool(plan.get("briefs_reviewed"))},{"key":"travel_confirmed","label":"Travel arrangements confirmed","done":bool(plan.get("travel_confirmed"))}]
@@ -6542,12 +7637,16 @@ def trip_prep():
     except (TypeError, ValueError):
         planner_year = today.year
     planner_year = min(max(planner_year, today.year - 5), today.year + 10)
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        planner_plans = connection.execute(
-            "SELECT * FROM trip_plans WHERE substr(start_date,1,4)=? OR substr(end_date,1,4)=? OR (start_date < ? AND end_date > ?) ORDER BY start_date, id",
-            (str(planner_year), str(planner_year), f"{planner_year}-01-01", f"{planner_year}-12-31"),
-        ).fetchall()
+        owner_user_id = _trip_owner_user_id()
+        planner_sql = "SELECT * FROM trip_plans WHERE (substr(start_date,1,4)=? OR substr(end_date,1,4)=? OR (start_date < ? AND end_date > ?))"
+        planner_params = [str(planner_year), str(planner_year), f"{planner_year}-01-01", f"{planner_year}-12-31"]
+        if owner_user_id is not None:
+            planner_sql += " AND owner_user_id=?"
+            planner_params.append(owner_user_id)
+        planner_sql += " ORDER BY start_date, id"
+        planner_plans = connection.execute(planner_sql, planner_params).fetchall()
     planner_months = build_year_planner(planner_year, planner_plans, plan.get("id"))
 
     return render_template_string(PAGE,view="trip_prep",open_action_count=get_open_action_count(),prep_rows=prep_rows,appointments=appointments,brochure_types=BROCHURE_TYPES,latest_schedule_filename=latest_schedule["filename"] if latest_schedule else None,latest_schedule_uploaded=uploaded_display,trip_prep_error=error,trip_prep_success=success,trip_plan=plan,readiness=readiness,booking_statuses=["Not Required","Not Booked","Quote Received","Booked","Paid","Completed"],planner_year=planner_year,planner_months=planner_months)
@@ -6572,11 +7671,22 @@ def customer_priority_classification(value_points, growth_points, opportunity_po
 
 def build_customer_priority_rows():
     today = date.today()
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
         manual_rows = {r["store_name"].strip().lower(): dict(r) for r in connection.execute("SELECT * FROM customer_priorities").fetchall()}
-        analyses = connection.execute("SELECT store_name, analysis_json FROM opportunity_analyses").fetchall()
-        actions = connection.execute("SELECT store_name, priority, status FROM store_actions WHERE status != 'Completed'").fetchall()
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            analyses = connection.execute("SELECT store_name, analysis_json FROM opportunity_analyses WHERE owner_user_id=?", (owner_user_id,)).fetchall()
+        else:
+            analyses = connection.execute("SELECT store_name, analysis_json FROM opportunity_analyses").fetchall()
+        action_owner_user_id = _private_workspace_user_id()
+        if action_owner_user_id is not None:
+            actions = connection.execute(
+                "SELECT store_name, priority, status FROM store_actions WHERE status != 'Completed' AND owner_user_id=?",
+                (action_owner_user_id,),
+            ).fetchall()
+        else:
+            actions = connection.execute("SELECT store_name, priority, status FROM store_actions WHERE status != 'Completed'").fetchall()
         mapped_rows = {r["name"].strip().lower(): dict(r) for r in connection.execute("SELECT * FROM route_customers").fetchall() if r["name"]}
 
     stores = {}
@@ -6683,6 +7793,7 @@ def build_customer_priority_rows():
             "customer_close_time": str(mapped.get("customer_close_time", "17:00") or "17:00"),
             "latitude": mapped.get("latitude"), "longitude": mapped.get("longitude"),
             "external_id": str(mapped.get("external_id", "") or ""), "portatour_id": str(mapped.get("portatour_id", "") or ""),
+            "route_customer_id": mapped.get("id"),
             "is_mapped_customer": bool(mapped),
         })
     return sorted(rows, key=lambda r: (-r["score"], r["store_name"].lower()))
@@ -6694,6 +7805,8 @@ def customer_priorities():
         store_name = request.form.get("store_name", "").strip()
         if not store_name:
             return redirect(url_for("customer_priorities", error="Customer name is required."))
+        if not _customer_visible_to_current_user(store_name):
+            abort(403)
         try:
             growth = max(1, min(5, int(request.form.get("growth_potential", 3))))
             frequency = max(1, int(request.form.get("visit_frequency_days", 42)))
@@ -6702,18 +7815,19 @@ def customer_priorities():
             return redirect(url_for("customer_priorities", error="Potential, visit cycle and sales value must be valid numbers."))
         last_visit = request.form.get("last_visit_date", "").strip()
         notes = request.form.get("strategic_notes", "").strip()
-        with sqlite3.connect(DATABASE_PATH) as connection:
+        with db_connect() as connection:
+            customer_id = _resolve_customer_id(connection, store_name)
             connection.execute(
-                """INSERT INTO customer_priorities (store_name, growth_potential, visit_frequency_days, last_visit_date, manual_sales_value, strategic_notes, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(store_name) DO UPDATE SET growth_potential=excluded.growth_potential, visit_frequency_days=excluded.visit_frequency_days,
+                """INSERT INTO customer_priorities (store_name, customer_id, growth_potential, visit_frequency_days, last_visit_date, manual_sales_value, strategic_notes, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(store_name) DO UPDATE SET customer_id=excluded.customer_id, growth_potential=excluded.growth_potential, visit_frequency_days=excluded.visit_frequency_days,
                 last_visit_date=excluded.last_visit_date, manual_sales_value=excluded.manual_sales_value, strategic_notes=excluded.strategic_notes, updated_at=excluded.updated_at""",
-                (store_name, growth, frequency, last_visit, manual_sales, notes, datetime.now().isoformat(timespec="seconds")),
+                (store_name, customer_id, growth, frequency, last_visit, manual_sales, notes, datetime.now().isoformat(timespec="seconds")),
             )
             connection.commit()
         return redirect(url_for("customer_priorities", success=f"{store_name} priority settings saved."))
 
-    rows = build_customer_priority_rows()
+    rows = _filter_customer_rows(build_customer_priority_rows())
     counts = {"protect": 0, "grow": 0, "maintain": 0, "low": 0}
     for row in rows:
         counts[row["class_key"]] += 1
@@ -6723,23 +7837,116 @@ def customer_priorities():
 
 
 
+def _customer_match_key(value):
+    from html import unescape
+    from urllib.parse import unquote
+    text = unescape(unquote(str(value or ""))).replace("\u00a0", " ")
+    return " ".join(text.split()).casefold()
+
+
+def _load_route_customer_by_name(store_name):
+    requested_key = _customer_match_key(store_name)
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        records = connection.execute("SELECT * FROM route_customers WHERE name IS NOT NULL").fetchall()
+    for record in records:
+        if _customer_match_key(record["name"]) == requested_key:
+            return dict(record)
+    return None
+
+
+def _load_route_customer_by_id(customer_id):
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        record = connection.execute("SELECT * FROM route_customers WHERE id=?", (customer_id,)).fetchone()
+    return dict(record) if record else None
+
+
+@app.route("/customers/id/<int:customer_id>")
+def customer_detail_by_id(customer_id):
+    route_customer = _load_route_customer_by_id(customer_id)
+    if route_customer is None:
+        return redirect(url_for("customer_priorities", error="That customer could not be found."))
+    return _customer_detail_page(route_customer["name"], route_customer=route_customer)
+
+
 @app.route("/customers/<path:store_name>")
 def customer_detail(store_name):
+    route_customer = _load_route_customer_by_name(store_name)
+    canonical_name = route_customer["name"] if route_customer else store_name
+    return _customer_detail_page(canonical_name, route_customer=route_customer)
+
+
+def _customer_detail_page(store_name, route_customer=None):
+    requested_key = _customer_match_key(store_name)
     rows = build_customer_priority_rows()
-    customer = next((row for row in rows if row["store_name"].strip().lower() == store_name.strip().lower()), None)
+    customer = next((row for row in rows if _customer_match_key(row.get("store_name")) == requested_key), None)
+
+    if customer is None and route_customer is not None:
+        customer = {
+            "store_name": route_customer.get("name", store_name),
+            "customer_group": route_customer.get("customer_group", "Other"),
+            "address_display": ", ".join(part for part in [route_customer.get("street", ""), route_customer.get("city", ""), route_customer.get("zip", "")] if part),
+            "strategic_notes": "", "call_note": route_customer.get("call_note", ""),
+            "priority_tier": route_customer.get("priority_tier", "C"),
+            "classification": "Maintain", "class_key": "maintain", "score": 0,
+            "sales_display": money(0), "yoy_display": fmt_percent(0), "opportunity_display": money(0),
+            "score_breakdown": "No performance data saved yet",
+            "open_actions": 0, "high_actions": 0, "growth_potential": 3,
+            "visit_frequency_days": route_customer.get("call_interval", 42),
+            "last_visit_date": route_customer.get("last_call", ""),
+            "visit_status": "No visit date",
+            "visit_detail": f"Suggested cycle: every {int(route_customer.get('call_interval', 42) or 42)} days",
+            "manual_sales_value": "0.00",
+            "street": route_customer.get("street", ""), "city": route_customer.get("city", ""),
+            "zip": route_customer.get("zip", ""), "country": route_customer.get("country", ""),
+            "phone": route_customer.get("phone", ""), "email": route_customer.get("email", ""),
+            "categories": route_customer.get("categories", ""), "urgency": route_customer.get("urgency", ""),
+            "ideal_call_minutes": route_customer.get("ideal_call_minutes", 45),
+            "customer_open_time": route_customer.get("customer_open_time", "08:00"),
+            "customer_close_time": route_customer.get("customer_close_time", "17:00"),
+            "latitude": route_customer.get("latitude"), "longitude": route_customer.get("longitude"),
+            "external_id": route_customer.get("external_id", ""), "portatour_id": route_customer.get("portatour_id", ""),
+            "route_customer_id": route_customer.get("id"), "is_mapped_customer": True,
+        }
+
     if customer is None:
         return redirect(url_for("customer_priorities", error="That customer could not be found."))
-    customer["customer_type"] = classify_customer(customer["store_name"])
-    with sqlite3.connect(DATABASE_PATH) as connection:
+
+    canonical_store_name = customer["store_name"]
+    if route_customer is None:
+        route_customer = _load_route_customer_by_name(canonical_store_name)
+    customer_id = int(route_customer["id"]) if route_customer and route_customer.get("id") else None
+    customer["route_customer_id"] = customer_id
+    if route_customer:
+        for field in ("street","city","zip","country","phone","email","categories","urgency","ideal_call_minutes","priority_tier","customer_open_time","customer_close_time","latitude","longitude","external_id","portatour_id","call_note","customer_group"):
+            if field in route_customer:
+                customer[field] = route_customer.get(field)
+        customer["is_mapped_customer"] = True
+        customer["address_display"] = ", ".join(part for part in [route_customer.get("street", ""), route_customer.get("city", ""), route_customer.get("zip", "")] if part)
+    if not _customer_visible_to_current_user(canonical_store_name):
+        abort(403)
+    customer["store_name"] = canonical_store_name
+    customer["customer_type"] = classify_customer(canonical_store_name)
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        action_records = connection.execute(
-            "SELECT * FROM store_actions WHERE lower(trim(store_name)) = lower(trim(?)) AND status != 'Completed' ORDER BY CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, due_date, updated_at DESC",
-            (customer["store_name"],),
-        ).fetchall()
-        analysis_record = connection.execute(
-            "SELECT * FROM opportunity_analyses WHERE lower(trim(store_name)) = lower(trim(?)) LIMIT 1",
-            (customer["store_name"],),
-        ).fetchone()
+        action_clause, action_params = _customer_link_clause(customer_id, canonical_store_name)
+        action_owner_user_id = _private_workspace_user_id()
+        action_sql = f"SELECT * FROM store_actions WHERE {action_clause} AND status != 'Completed'"
+        if action_owner_user_id is not None:
+            action_sql += " AND owner_user_id=?"
+            action_params.append(action_owner_user_id)
+        action_sql += " ORDER BY CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, due_date, updated_at DESC"
+        action_records = connection.execute(action_sql, action_params).fetchall()
+
+        analysis_clause, analysis_params = _customer_link_clause(customer_id, canonical_store_name)
+        owner_user_id = _private_performance_user_id()
+        analysis_sql = f"SELECT * FROM opportunity_analyses WHERE {analysis_clause}"
+        if owner_user_id is not None:
+            analysis_sql += " AND owner_user_id=?"
+            analysis_params.append(owner_user_id)
+        analysis_sql += " ORDER BY saved_at DESC LIMIT 1"
+        analysis_record = connection.execute(analysis_sql, analysis_params).fetchone()
     customer_actions = [action_display_row(record) for record in action_records]
     analysis = None
     analysis_id = None
@@ -6749,14 +7956,22 @@ def customer_detail(store_name):
             analysis_id = analysis_record["id"]
         except json.JSONDecodeError:
             analysis = None
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
-        contacts=[dict(r) for r in connection.execute("SELECT * FROM customer_contacts WHERE lower(trim(store_name))=lower(trim(?)) ORDER BY contact_name COLLATE NOCASE",(store_name,)).fetchall()]
-        history_rows=connection.execute("""SELECT n.*,s.trip_plan_id,p.trip_name,o.desired_outcome FROM road_visit_notes n LEFT JOIN trip_schedules s ON s.id=n.schedule_id LEFT JOIN trip_plans p ON p.id=s.trip_plan_id LEFT JOIN appointment_objectives o ON o.appointment_id=n.appointment_id WHERE lower(trim(n.store_name))=lower(trim(?)) ORDER BY n.visit_date DESC,n.visit_time DESC""",(store_name,)).fetchall()
-        attachments=connection.execute("SELECT * FROM road_visit_attachments WHERE lower(trim(store_name))=lower(trim(?)) ORDER BY uploaded_at DESC",(store_name,)).fetchall()
+        contacts_clause, contacts_params = _customer_link_clause(customer_id, canonical_store_name)
+        contacts=[dict(r) for r in connection.execute(f"SELECT * FROM customer_contacts WHERE {contacts_clause} ORDER BY contact_name COLLATE NOCASE", contacts_params).fetchall()]
+
+        notes_clause, notes_params = _customer_link_clause(customer_id, canonical_store_name, "n")
+        history_rows=connection.execute(f"""SELECT n.*,s.trip_plan_id,p.trip_name,o.desired_outcome FROM road_visit_notes n LEFT JOIN trip_schedules s ON s.id=n.schedule_id LEFT JOIN trip_plans p ON p.id=s.trip_plan_id LEFT JOIN appointment_objectives o ON o.appointment_id=n.appointment_id WHERE {notes_clause} ORDER BY n.visit_date DESC,n.visit_time DESC""",notes_params).fetchall()
+
+        attachments_clause, attachments_params = _customer_link_clause(customer_id, canonical_store_name)
+        attachments=connection.execute(f"SELECT * FROM road_visit_attachments WHERE {attachments_clause} ORDER BY uploaded_at DESC",attachments_params).fetchall()
         att_map={}
         for a in attachments: att_map.setdefault(a['appointment_id'] or (a['visit_date'],a['visit_time']),[]).append({'original_name':a['original_name'],'url':url_for('road_attachment',attachment_id=a['id'])})
-        upcoming=connection.execute("""SELECT o.*,p.trip_name FROM appointment_objectives o LEFT JOIN trip_plans p ON p.id=o.trip_plan_id WHERE lower(trim(o.store_name))=lower(trim(?)) AND o.visit_date>=? ORDER BY o.visit_date,o.visit_time""",(store_name,date.today().isoformat())).fetchall()
+
+        objective_clause, objective_params = _customer_link_clause(customer_id, canonical_store_name, "o")
+        objective_params.append(date.today().isoformat())
+        upcoming=connection.execute(f"""SELECT o.*,p.trip_name FROM appointment_objectives o LEFT JOIN trip_plans p ON p.id=o.trip_plan_id WHERE {objective_clause} AND o.visit_date>=? ORDER BY o.visit_date,o.visit_time""",objective_params).fetchall()
     customer_call_history=[]
     for r in history_rows:
         status='Completed' if r['completed'] else ('Skipped' if r['skipped'] else 'Recorded')
@@ -6766,20 +7981,60 @@ def customer_detail(store_name):
         PAGE, view="customer_detail", customer=customer, customer_actions=customer_actions,
         analysis=analysis, analysis_id=analysis_id, open_action_count=get_open_action_count(),
         customer_contacts=contacts, customer_call_history=customer_call_history, upcoming_customer_visits=upcoming_customer_visits,
+        success=request.args.get("success"), error=request.args.get("error"),
     )
+
+@app.route("/customers/id/<int:customer_id>/edit", methods=["POST"])
+@admin_required
+def edit_customer_account(customer_id):
+    new_name = " ".join(request.form.get("name", "").split())
+    if not new_name:
+        return redirect(url_for("customer_detail_by_id", customer_id=customer_id, error="Customer name is required."))
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        customer = connection.execute("SELECT * FROM route_customers WHERE id=?", (customer_id,)).fetchone()
+        if customer is None:
+            return redirect(url_for("customer_priorities", error="That customer could not be found."))
+        old_name = customer["name"]
+        duplicate = connection.execute("SELECT id FROM route_customers WHERE lower(trim(name))=lower(trim(?)) AND id!=?", (new_name, customer_id)).fetchone()
+        if duplicate:
+            return redirect(url_for("customer_detail_by_id", customer_id=customer_id, error="Another customer already uses that name."))
+        try:
+            call_interval = max(1, int(request.form.get("call_interval", customer["call_interval"] or 42)))
+            ideal_call_minutes = max(10, int(request.form.get("ideal_call_minutes", customer["ideal_call_minutes"] or 45)))
+        except (TypeError, ValueError):
+            return redirect(url_for("customer_detail_by_id", customer_id=customer_id, error="Call cycle and duration must be valid numbers."))
+        tier = (request.form.get("priority_tier", customer["priority_tier"] or "C").strip().upper() or "C")
+        if tier not in {"A","B","C","D"}:
+            tier = "C"
+        connection.execute(
+            """UPDATE route_customers SET name=?,customer_group=?,street=?,city=?,zip=?,phone=?,email=?,priority_tier=?,call_interval=?,ideal_call_minutes=?,updated_at=? WHERE id=?""",
+            (new_name, request.form.get("customer_group", "").strip() or "Other", request.form.get("street", "").strip(), request.form.get("city", "").strip(), request.form.get("zip", "").strip(), request.form.get("phone", "").strip(), request.form.get("email", "").strip(), tier, call_interval, ideal_call_minutes, now, customer_id),
+        )
+        # Keep denormalised display names aligned while durable customer_id remains authoritative.
+        for table in ("customer_priorities","store_actions","opportunity_analyses","customer_contacts","road_visit_notes","road_visit_attachments","appointment_objectives"):
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "store_name" in columns:
+                connection.execute(f"UPDATE {table} SET store_name=?, customer_id=? WHERE customer_id=? OR (customer_id IS NULL AND lower(trim(store_name))=lower(trim(?)))", (new_name, customer_id, customer_id, old_name))
+        connection.commit()
+    return redirect(url_for("customer_detail_by_id", customer_id=customer_id, success=f"{new_name} account updated."))
+
 
 @app.route("/customer-contact/add",methods=["POST"])
 def add_customer_contact():
     store=request.form.get("store_name","").strip(); name=request.form.get("contact_name","").strip(); now=datetime.now().isoformat(timespec="seconds")
+    customer_id=request.form.get("customer_id", type=int)
     if store and name:
-        with sqlite3.connect(DATABASE_PATH) as connection:
-            connection.execute("INSERT INTO customer_contacts (store_name,contact_name,role,phone,email,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",(store,name,request.form.get("role","").strip(),request.form.get("phone","").strip(),request.form.get("email","").strip(),request.form.get("notes","").strip(),now,now)); connection.commit()
-    return redirect(url_for("customer_detail",store_name=store))
+        with db_connect() as connection:
+            customer_id = customer_id or _resolve_customer_id(connection, store)
+            connection.execute("INSERT INTO customer_contacts (store_name,customer_id,contact_name,role,phone,email,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",(store,customer_id,name,request.form.get("role","").strip(),request.form.get("phone","").strip(),request.form.get("email","").strip(),request.form.get("notes","").strip(),now,now)); connection.commit()
+    return redirect(url_for("customer_detail_by_id",customer_id=customer_id) if customer_id else url_for("customer_detail",store_name=store))
 
 @app.route("/customer-contact/<int:contact_id>/delete",methods=["POST"])
 def delete_customer_contact(contact_id):
     store=request.form.get("store_name","").strip()
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.execute("DELETE FROM customer_contacts WHERE id=?",(contact_id,)); connection.commit()
     return redirect(url_for("customer_detail",store_name=store))
 
@@ -6788,24 +8043,46 @@ def on_the_road():
     from urllib.parse import quote_plus
     road_rows = []
     requested_trip_id = request.args.get("trip_id", type=int) or get_active_trip_id()
-    if requested_trip_id:
-        set_active_trip(requested_trip_id)
     active_trip = None
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
+        owner_user_id = _trip_owner_user_id()
         if requested_trip_id:
-            active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (requested_trip_id,)).fetchone()
-            schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (requested_trip_id,)).fetchone()
+            active_trip = _trip_row_for_current_user(connection, requested_trip_id)
+            if active_trip is None and owner_user_id is not None:
+                abort(403)
+            schedule = connection.execute("SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1", (requested_trip_id,)).fetchone() if active_trip else None
         else:
-            schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
+            if owner_user_id is not None:
+                schedule = connection.execute("SELECT * FROM trip_schedules WHERE owner_user_id=? ORDER BY id DESC LIMIT 1", (owner_user_id,)).fetchone()
+            else:
+                schedule = connection.execute("SELECT * FROM trip_schedules ORDER BY id DESC LIMIT 1").fetchone()
             if schedule and schedule["trip_plan_id"]:
-                active_trip = connection.execute("SELECT * FROM trip_plans WHERE id=?", (schedule["trip_plan_id"],)).fetchone()
-        actions = connection.execute("SELECT store_name, title FROM store_actions WHERE status != 'Completed'").fetchall()
-        customers = {row[0].strip().lower() for row in connection.execute(
-            "SELECT store_name FROM customer_priorities UNION SELECT store_name FROM opportunity_analyses UNION SELECT DISTINCT store_name FROM store_actions"
-        ).fetchall() if row[0]}
-        route_customers = {row["name"].strip().lower(): row for row in connection.execute("SELECT * FROM route_customers").fetchall()}
-        priority_rows = build_customer_priority_rows()
+                active_trip = _trip_row_for_current_user(connection, schedule["trip_plan_id"])
+        if active_trip:
+            set_active_trip(active_trip["id"])
+        action_owner_user_id = _private_workspace_user_id()
+        if action_owner_user_id is not None:
+            actions = connection.execute(
+                "SELECT store_name, title FROM store_actions WHERE status != 'Completed' AND owner_user_id=?",
+                (action_owner_user_id,),
+            ).fetchall()
+            customers = {row[0].strip().lower() for row in connection.execute(
+                "SELECT store_name FROM customer_priorities UNION SELECT store_name FROM opportunity_analyses WHERE owner_user_id=? UNION SELECT DISTINCT store_name FROM store_actions WHERE owner_user_id=?",
+                (action_owner_user_id, action_owner_user_id),
+            ).fetchall() if row[0]}
+        else:
+            actions = connection.execute("SELECT store_name, title FROM store_actions WHERE status != 'Completed'").fetchall()
+            customers = {row[0].strip().lower() for row in connection.execute(
+                "SELECT store_name FROM customer_priorities UNION SELECT store_name FROM opportunity_analyses UNION SELECT DISTINCT store_name FROM store_actions"
+            ).fetchall() if row[0]}
+        territory_user_id = _territory_user_id()
+        if territory_user_id is None:
+            territory_rows = connection.execute("SELECT * FROM route_customers").fetchall()
+        else:
+            territory_rows = connection.execute("SELECT * FROM route_customers WHERE assigned_user_id=?", (territory_user_id,)).fetchall()
+        route_customers = {row["name"].strip().lower(): row for row in territory_rows}
+        priority_rows = _filter_customer_rows(build_customer_priority_rows())
         priority_map = {row["store_name"].strip().lower(): row for row in priority_rows}
         saved_notes, attachment_map = {}, {}
         objective_map={}
@@ -6822,8 +8099,11 @@ def on_the_road():
         action_map.setdefault(action["store_name"].strip().lower(), []).append(action["title"])
     if schedule:
         appointments = parse_schedule_appointments(schedule["raw_html"], from_date=date.min if active_trip else date.today())[:100]
+        visible_names = _visible_customer_names()
         for item in appointments:
             store_key = item["store"].strip().lower()
+            if visible_names is not None and store_key not in visible_names:
+                continue
             titles = action_map.get(store_key, [])
             note_key = (item["date"].isoformat(), item["time"], store_key)
             saved = saved_notes.get(note_key)
@@ -6854,7 +8134,7 @@ def on_the_road():
                 try: actual_time_text += (" · " if actual_time_text else "") + "finished " + datetime.fromisoformat(finished).strftime("%H:%M")
                 except ValueError: pass
             appt_id = appointment_uid(active_trip["id"] if active_trip else schedule["trip_plan_id"], schedule["id"], item["date"].isoformat(), item["time"], item["store"])
-            with sqlite3.connect(DATABASE_PATH) as appt_connection:
+            with db_connect() as appt_connection:
                 appt_connection.execute("INSERT INTO trip_appointments (appointment_id,trip_id,schedule_id,visit_date,visit_time,store_name,sequence_no,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(appointment_id) DO UPDATE SET visit_date=excluded.visit_date,visit_time=excluded.visit_time,store_name=excluded.store_name,sequence_no=excluded.sequence_no,updated_at=excluded.updated_at",
                     (appt_id, active_trip["id"] if active_trip else (schedule["trip_plan_id"] or 0), schedule["id"], item["date"].isoformat(), item["time"], item["store"], len(road_rows)+1, datetime.now().isoformat(timespec="seconds")))
                 appt_connection.commit()
@@ -6910,9 +8190,10 @@ def _road_redirect(message=None, error=None):
 
 def _ensure_road_note(connection, schedule_id, visit_date, visit_time, store_name, appt_id=""):
     now=datetime.now().isoformat(timespec="seconds")
-    connection.execute("""INSERT INTO road_visit_notes (schedule_id,visit_date,visit_time,store_name,visit_notes,completed,updated_at,appointment_id)
-        VALUES (?,?,?,?,?,0,?,?) ON CONFLICT(schedule_id,visit_date,visit_time,store_name) DO UPDATE SET appointment_id=CASE WHEN excluded.appointment_id!='' THEN excluded.appointment_id ELSE road_visit_notes.appointment_id END""",
-        (schedule_id,visit_date,visit_time,store_name,"",now,appt_id))
+    customer_id = _resolve_customer_id(connection, store_name)
+    connection.execute("""INSERT INTO road_visit_notes (schedule_id,visit_date,visit_time,store_name,customer_id,visit_notes,completed,updated_at,appointment_id)
+        VALUES (?,?,?,?,?,?,0,?,?) ON CONFLICT(schedule_id,visit_date,visit_time,store_name) DO UPDATE SET customer_id=excluded.customer_id, appointment_id=CASE WHEN excluded.appointment_id!='' THEN excluded.appointment_id ELSE road_visit_notes.appointment_id END""",
+        (schedule_id,visit_date,visit_time,store_name,customer_id,"",now,appt_id))
 
 
 @app.route("/on-the-road/event", methods=["POST"])
@@ -6921,7 +8202,7 @@ def road_visit_event():
     event=request.form.get("event","")
     if not schedule_id or not visit_date or not store_name: return _road_redirect(error="Visit details were incomplete.")
     now=datetime.now().isoformat(timespec="seconds")
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
         _ensure_road_note(connection,schedule_id,visit_date,visit_time,store_name,appt_id)
         row=connection.execute("SELECT * FROM road_visit_notes WHERE schedule_id=? AND visit_date=? AND visit_time=? AND store_name=?",(schedule_id,visit_date,visit_time,store_name)).fetchone()
@@ -6958,7 +8239,7 @@ def update_road_visit():
     followup_due = request.form.get("followup_due", "").strip()
     now = datetime.now().isoformat(timespec="seconds")
     duration = 0
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
         _ensure_road_note(connection, schedule_id, visit_date, visit_time, store_name, appt_id)
         row = connection.execute(
@@ -6970,14 +8251,21 @@ def update_road_visit():
             (visit_notes, outcome, next_step, now, schedule_id, visit_date, visit_time, store_name),
         )
         if followup_title:
-            existing = connection.execute(
-                "SELECT id FROM store_actions WHERE lower(trim(store_name))=lower(trim(?)) AND lower(trim(title))=lower(trim(?)) AND status!='Completed' LIMIT 1",
-                (store_name, followup_title),
-            ).fetchone()
+            action_owner_user_id = _private_workspace_user_id()
+            if action_owner_user_id is not None:
+                existing = connection.execute(
+                    "SELECT id FROM store_actions WHERE lower(trim(store_name))=lower(trim(?)) AND lower(trim(title))=lower(trim(?)) AND status!='Completed' AND owner_user_id=? LIMIT 1",
+                    (store_name, followup_title, action_owner_user_id),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT id FROM store_actions WHERE lower(trim(store_name))=lower(trim(?)) AND lower(trim(title))=lower(trim(?)) AND status!='Completed' LIMIT 1",
+                    (store_name, followup_title),
+                ).fetchone()
             if not existing:
                 connection.execute(
-                    "INSERT INTO store_actions (store_name,title,detail,priority,status,due_date,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (store_name, followup_title, next_step or visit_notes, "Medium", "Open", followup_due, "On the Road", now, now),
+                    "INSERT INTO store_actions (store_name,title,detail,priority,status,due_date,source,created_at,updated_at,owner_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (store_name, followup_title, next_step or visit_notes, "Medium", "Open", followup_due, "On the Road", now, now, action_owner_user_id),
                 )
         attachment = request.files.get("attachment")
         if attachment and attachment.filename:
@@ -7018,12 +8306,120 @@ def update_road_visit():
 
 @app.route("/on-the-road/attachment/<int:attachment_id>")
 def road_attachment(attachment_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
         row=connection.execute("SELECT * FROM road_visit_attachments WHERE id=?",(attachment_id,)).fetchone()
     if not row: return "Attachment not found",404
     folder=DATA_DIR/"road_visit_files"
     return send_from_directory(folder,row["stored_name"],as_attachment=False,download_name=row["original_name"])
+
+
+@app.route("/team-dashboard")
+@territory_manager_required
+def team_dashboard():
+    today = date.today()
+    month_start = today.replace(day=1).isoformat()
+    week_start = monday_for(today).isoformat()
+    week_key = monday_for(today).isoformat()
+    quarter = (today.month - 1) // 3
+    quarter_start = date(today.year, quarter * 3 + 1, 1).isoformat()
+    quarter_end_month = quarter * 3 + 3
+    if quarter_end_month == 12:
+        quarter_end = date(today.year + 1, 1, 1)
+    else:
+        quarter_end = date(today.year, quarter_end_month + 1, 1)
+    quarter_end_iso = quarter_end.isoformat()
+    now_iso = today.isoformat()
+
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        reps = [dict(r) for r in connection.execute(
+            "SELECT id,email,display_name FROM app_users WHERE role='sales_rep' AND active=1 ORDER BY display_name"
+        ).fetchall()]
+        team_rows = []
+        for rep in reps:
+            uid = int(rep["id"])
+            customers = [dict(r) for r in connection.execute(
+                "SELECT id,name,priority_tier,last_call,call_interval FROM route_customers WHERE assigned_user_id=?", (uid,)
+            ).fetchall()]
+            customer_ids = [int(c["id"]) for c in customers]
+            latest_visits = {}
+            if customer_ids:
+                placeholders = ",".join("?" for _ in customer_ids)
+                for r in connection.execute(f"SELECT customer_id,MAX(visit_date) AS last_visit FROM road_visit_notes WHERE completed=1 AND customer_id IN ({placeholders}) GROUP BY customer_id", tuple(customer_ids)).fetchall():
+                    if r[0] is not None and r[1]: latest_visits[int(r[0])] = str(r[1])[:10]
+            overdue_customers = 0
+            overdue_a = 0
+            stale60 = 0
+            stale90 = 0
+            attention = []
+            for c in customers:
+                last_call = latest_visits.get(int(c["id"])) or str(c.get("last_call") or "")[:10]
+                interval = int(c.get("call_interval") or 42)
+                days = None
+                try: days = (today - date.fromisoformat(last_call)).days if last_call else None
+                except ValueError: days = None
+                overdue = days is None or days > interval
+                if overdue: overdue_customers += 1
+                if overdue and str(c.get("priority_tier") or "").upper() == "A": overdue_a += 1
+                if days is None or days >= 60: stale60 += 1
+                if days is None or days >= 90: stale90 += 1
+                if overdue:
+                    attention.append({"id": c["id"], "name": c["name"], "tier": str(c.get("priority_tier") or "C").upper(), "days": days})
+            a_tier = sum(1 for c in customers if str(c.get("priority_tier") or "").upper() == "A")
+            coverage_percent = round((len(customers)-overdue_customers)/len(customers)*100) if customers else 100
+            attention.sort(key=lambda x: (0 if x["tier"] == "A" else 1, -(x["days"] if x["days"] is not None else 99999)))
+            attention = attention[:5]
+
+            actions = [dict(r) for r in connection.execute(
+                "SELECT priority,due_date FROM store_actions WHERE owner_user_id=? AND status!='Completed'", (uid,)
+            ).fetchall()]
+            overdue_actions = sum(1 for a in actions if a.get("due_date") and str(a["due_date"])[:10] < now_iso)
+            high_actions = sum(1 for a in actions if a.get("priority") == "High")
+
+            calls_week = connection.execute(
+                "SELECT COUNT(*) FROM road_visit_notes n JOIN trip_schedules s ON s.id=n.schedule_id JOIN trip_plans p ON p.id=s.trip_plan_id WHERE p.owner_user_id=? AND n.completed=1 AND n.visit_date>=?",
+                (uid, week_start),
+            ).fetchone()[0]
+            calls_month = connection.execute(
+                "SELECT COUNT(*) FROM road_visit_notes n JOIN trip_schedules s ON s.id=n.schedule_id JOIN trip_plans p ON p.id=s.trip_plan_id WHERE p.owner_user_id=? AND n.completed=1 AND n.visit_date>=?",
+                (uid, month_start),
+            ).fetchone()[0]
+
+            checklist_done = connection.execute(
+                "SELECT COUNT(*) FROM user_weekly_checklist WHERE owner_user_id=? AND week_key=? AND is_done=1", (uid, week_key)
+            ).fetchone()[0]
+            checklist_total = len(WEEKLY_CHECKLIST_ITEMS)
+            checklist_percent = round(checklist_done / checklist_total * 100) if checklist_total else 0
+
+            bonus_qtd = connection.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM rep_bonus_transactions WHERE owner_user_id=? AND txn_date>=? AND txn_date<?",
+                (uid, quarter_start, quarter_end_iso),
+            ).fetchone()[0] or 0
+
+            upcoming = [dict(r) for r in connection.execute(
+                "SELECT id,trip_name,destination,start_date,end_date FROM trip_plans WHERE owner_user_id=? AND end_date>=? AND COALESCE(completed_at,'')='' ORDER BY start_date,id",
+                (uid, now_iso),
+            ).fetchall()]
+            team_rows.append({
+                **rep,
+                "customer_count": len(customers), "overdue_customers": overdue_customers, "a_tier": a_tier,
+                "overdue_a": overdue_a, "stale60": stale60, "stale90": stale90, "coverage_percent": coverage_percent, "attention": attention,
+                "open_actions": len(actions), "overdue_actions": overdue_actions, "high_actions": high_actions,
+                "calls_week": int(calls_week or 0), "calls_month": int(calls_month or 0),
+                "checklist_done": int(checklist_done or 0), "checklist_total": checklist_total, "checklist_percent": checklist_percent,
+                "bonus_qtd_display": money(float(bonus_qtd)), "upcoming_trip_count": len(upcoming), "next_trip": upcoming[0] if upcoming else None,
+            })
+
+    team_totals = {
+        "reps": len(team_rows),
+        "customers": sum(r["customer_count"] for r in team_rows),
+        "overdue_customers": sum(r["overdue_customers"] for r in team_rows),
+        "overdue_a": sum(r["overdue_a"] for r in team_rows),
+        "overdue_actions": sum(r["overdue_actions"] for r in team_rows),
+        "calls_month": sum(r["calls_month"] for r in team_rows),
+    }
+    return render_template_string(PAGE, view="team_dashboard", team_rows=team_rows, team_totals=team_totals, open_action_count=get_open_action_count())
 
 
 @app.route("/control-centre")
@@ -7032,18 +8428,33 @@ def control_centre():
     week_start = monday_for(today)
     week_key = week_start.isoformat()
     week_end = today + timedelta(days=7)
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        incomplete = connection.execute(
-            "SELECT * FROM store_actions WHERE status != 'Completed' ORDER BY CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, due_date, updated_at DESC"
-        ).fetchall()
-        checklist_saved = dict(connection.execute(
-            "SELECT item_key, is_done FROM weekly_checklist WHERE week_key = ?", (week_key,)
-        ).fetchall())
+        workspace_owner_user_id = _private_workspace_user_id()
+        if workspace_owner_user_id is not None:
+            incomplete = connection.execute(
+                "SELECT * FROM store_actions WHERE status != 'Completed' AND owner_user_id=? ORDER BY CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, due_date, updated_at DESC",
+                (workspace_owner_user_id,),
+            ).fetchall()
+            checklist_saved = dict(connection.execute(
+                "SELECT item_key, is_done FROM user_weekly_checklist WHERE owner_user_id=? AND week_key=?",
+                (workspace_owner_user_id, week_key),
+            ).fetchall())
+        else:
+            incomplete = connection.execute(
+                "SELECT * FROM store_actions WHERE status != 'Completed' ORDER BY CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, due_date, updated_at DESC"
+            ).fetchall()
+            checklist_saved = dict(connection.execute(
+                "SELECT item_key, is_done FROM weekly_checklist WHERE week_key = ?", (week_key,)
+            ).fetchall())
         latest_run = connection.execute(
             "SELECT raw_notes FROM follow_up_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        saved_stores = {row[0].lower() for row in connection.execute("SELECT store_name FROM opportunity_analyses").fetchall()}
+        owner_user_id = _private_performance_user_id()
+        if owner_user_id is not None:
+            saved_stores = {row[0].lower() for row in connection.execute("SELECT store_name FROM opportunity_analyses WHERE owner_user_id=?", (owner_user_id,)).fetchall()}
+        else:
+            saved_stores = {row[0].lower() for row in connection.execute("SELECT store_name FROM opportunity_analyses").fetchall()}
 
     overdue = [r for r in incomplete if r["due_date"] and r["due_date"] < today.isoformat()]
     high = [r for r in incomplete if r["priority"] == "High"]
@@ -7089,13 +8500,20 @@ def control_centre():
 def update_weekly_checklist():
     week_key = request.form.get("week_key", monday_for(date.today()).isoformat())
     now = datetime.now().isoformat(timespec="seconds")
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
+        workspace_owner_user_id = _private_workspace_user_id()
         for item_key, _label in WEEKLY_CHECKLIST_ITEMS:
             done = 1 if request.form.get(f"item_{item_key}") else 0
-            connection.execute(
-                "INSERT INTO weekly_checklist (week_key,item_key,is_done,updated_at) VALUES (?,?,?,?) ON CONFLICT(week_key,item_key) DO UPDATE SET is_done=excluded.is_done, updated_at=excluded.updated_at",
-                (week_key, item_key, done, now),
-            )
+            if workspace_owner_user_id is not None:
+                connection.execute(
+                    "INSERT INTO user_weekly_checklist (owner_user_id,week_key,item_key,is_done,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(owner_user_id,week_key,item_key) DO UPDATE SET is_done=excluded.is_done, updated_at=excluded.updated_at",
+                    (workspace_owner_user_id, week_key, item_key, done, now),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO weekly_checklist (week_key,item_key,is_done,updated_at) VALUES (?,?,?,?) ON CONFLICT(week_key,item_key) DO UPDATE SET is_done=excluded.is_done, updated_at=excluded.updated_at",
+                    (week_key, item_key, done, now),
+                )
         connection.commit()
     return redirect(url_for("control_centre"))
 
@@ -7187,7 +8605,7 @@ def travel_expenses():
                 form["status"], form["flight_status"], form["rental_status"], form["accommodation_status"],
                 *cost_values, form["notes"].strip(), now,
             )
-            with sqlite3.connect(DATABASE_PATH) as connection:
+            with db_connect() as connection:
                 if trip_id:
                     connection.execute(
                         """UPDATE travel_trips SET trip_name=?, destination=?, start_date=?, end_date=?, status=?, flight_status=?, rental_status=?, accommodation_status=?, forecast_flights=?, actual_flights=?, forecast_rental=?, actual_rental=?, forecast_fuel=?, actual_fuel=?, forecast_accommodation=?, actual_accommodation=?, forecast_other=?, actual_other=?, notes=?, updated_at=? WHERE id=?""",
@@ -7208,7 +8626,7 @@ def travel_expenses():
     else:
         trip_form = travel_form_defaults()
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
         year_records = connection.execute("SELECT DISTINCT substr(start_date,1,4) AS year FROM travel_trips ORDER BY year DESC").fetchall()
         travel_years = [int(r["year"]) for r in year_records] or [date.today().year]
@@ -7262,7 +8680,7 @@ def travel_expenses():
 
 @app.route("/travel-expenses/<int:trip_id>/delete", methods=["POST"])
 def delete_travel_trip(trip_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.execute("DELETE FROM travel_trips WHERE id=?", (trip_id,))
         connection.commit()
     return redirect(url_for("travel_expenses", success="Trip deleted."))
@@ -7274,16 +8692,33 @@ def actions():
     selected_status = request.args.get("status", "").strip()
     query = "SELECT * FROM store_actions WHERE 1=1"
     params = []
+    owner_user_id = _private_workspace_user_id()
+    if owner_user_id is not None:
+        query += " AND owner_user_id = ?"
+        params.append(owner_user_id)
     if selected_store:
         query += " AND store_name = ?"; params.append(selected_store)
     if selected_status:
         query += " AND status = ?"; params.append(selected_status)
     query += " ORDER BY CASE priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END, CASE WHEN due_date = '' THEN 1 ELSE 0 END, due_date, updated_at DESC"
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
         records = connection.execute(query, params).fetchall()
-        stores = [r[0] for r in connection.execute("SELECT DISTINCT store_name FROM store_actions ORDER BY store_name COLLATE NOCASE").fetchall()]
-        counts = dict(connection.execute("SELECT status, COUNT(*) FROM store_actions GROUP BY status").fetchall())
+        visible_names = _visible_customer_names()
+        if visible_names is not None:
+            records = [r for r in records if str(r["store_name"] or "").strip().casefold() in visible_names]
+        if owner_user_id is not None:
+            stores = [r[0] for r in connection.execute(
+                "SELECT DISTINCT store_name FROM store_actions WHERE owner_user_id=? ORDER BY store_name COLLATE NOCASE",
+                (owner_user_id,),
+            ).fetchall()]
+        else:
+            stores = [r[0] for r in connection.execute("SELECT DISTINCT store_name FROM store_actions ORDER BY store_name COLLATE NOCASE").fetchall()]
+        if visible_names is not None:
+            stores = [name for name in stores if str(name or "").strip().casefold() in visible_names]
+        counts = {}
+        for r in records:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
     rows=[]
     for r in records:
         row=dict(r)
@@ -7305,27 +8740,35 @@ def new_action():
         initial = action_template_defaults(request.form)
         if not initial["store_name"].strip() or not initial["title"].strip():
             error="Store and action title are required."
+        elif not _customer_visible_to_current_user(initial["store_name"]):
+            abort(403)
         else:
             now=datetime.now().isoformat(timespec="seconds")
-            with sqlite3.connect(DATABASE_PATH) as connection:
-                connection.execute("INSERT INTO store_actions (store_name,title,detail,source,priority,due_date,status,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (initial["store_name"].strip(),initial["title"].strip(),initial["detail"].strip(),initial["source"].strip(),initial["priority"],initial["due_date"],initial["status"],initial["notes"].strip(),now,now)); connection.commit()
+            with db_connect() as connection:
+                owner_user_id = _private_workspace_user_id()
+                customer_id = _resolve_customer_id(connection, initial["store_name"].strip())
+                connection.execute("INSERT INTO store_actions (store_name,customer_id,title,detail,source,priority,due_date,status,notes,created_at,updated_at,owner_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (initial["store_name"].strip(),customer_id,initial["title"].strip(),initial["detail"].strip(),initial["source"].strip(),initial["priority"],initial["due_date"],initial["status"],initial["notes"].strip(),now,now,owner_user_id)); connection.commit()
             return redirect(url_for("actions", success="Action created successfully."))
     return render_template_string(PAGE, view="action_form", form_heading="Create Store Action", submit_label="Create Action", action_form=initial, action_statuses=ACTION_STATUSES, error=error, open_action_count=get_open_action_count())
 
 
 @app.route("/actions/<int:action_id>/edit", methods=["GET", "POST"])
 def edit_action(action_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
         record=connection.execute("SELECT * FROM store_actions WHERE id=?",(action_id,)).fetchone()
     if record is None: return redirect(url_for("actions", error="That action could not be found."))
+    if not _action_owned_by_current_user(record): abort(403)
+    if not _customer_visible_to_current_user(record["store_name"]): abort(403)
     form=action_template_defaults(dict(record)); error=None
     if request.method == "POST":
         form=action_template_defaults(request.form)
         if not form["store_name"].strip() or not form["title"].strip(): error="Store and action title are required."
+        elif not _customer_visible_to_current_user(form["store_name"]): abort(403)
         else:
-            with sqlite3.connect(DATABASE_PATH) as connection:
-                connection.execute("UPDATE store_actions SET store_name=?,title=?,detail=?,source=?,priority=?,due_date=?,status=?,notes=?,updated_at=? WHERE id=?",(form["store_name"].strip(),form["title"].strip(),form["detail"].strip(),form["source"].strip(),form["priority"],form["due_date"],form["status"],form["notes"].strip(),datetime.now().isoformat(timespec="seconds"),action_id)); connection.commit()
+            with db_connect() as connection:
+                customer_id = _resolve_customer_id(connection, form["store_name"].strip())
+                connection.execute("UPDATE store_actions SET store_name=?,customer_id=?,title=?,detail=?,source=?,priority=?,due_date=?,status=?,notes=?,updated_at=? WHERE id=?",(form["store_name"].strip(),customer_id,form["title"].strip(),form["detail"].strip(),form["source"].strip(),form["priority"],form["due_date"],form["status"],form["notes"].strip(),datetime.now().isoformat(timespec="seconds"),action_id)); connection.commit()
             return redirect(url_for("actions", success="Action updated successfully."))
     return render_template_string(PAGE, view="action_form", form_heading="Edit Store Action", submit_label="Save Changes", action_form=form, action_statuses=ACTION_STATUSES, error=error, open_action_count=get_open_action_count())
 
@@ -7334,7 +8777,12 @@ def edit_action(action_id):
 def update_action(action_id):
     status=request.form.get("status", "Open")
     if status not in ACTION_STATUSES: status="Open"
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
+        connection.row_factory = sqlite3.Row
+        action = connection.execute("SELECT store_name, owner_user_id FROM store_actions WHERE id=?", (action_id,)).fetchone()
+        if not action: abort(404)
+        if not _action_owned_by_current_user(action): abort(403)
+        if not _customer_visible_to_current_user(action["store_name"]): abort(403)
         connection.execute("UPDATE store_actions SET status=?, updated_at=? WHERE id=?",(status,datetime.now().isoformat(timespec="seconds"),action_id)); connection.commit()
     return redirect(request.referrer or url_for("actions"))
 
@@ -7355,7 +8803,7 @@ def import_portatour_customers(uploaded_file):
     frame = frame.dropna(subset=['Name','Latitude','Longitude'])
     now = datetime.now().isoformat(timespec='seconds')
     imported = 0
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         for _, row in frame.iterrows():
             def clean(field, default=''):
                 value = row.get(field, default)
@@ -7435,14 +8883,22 @@ def _workspace_haversine(lat1,lon1,lat2,lon2):
 
 def build_trip_workspace(trip_id):
     import calendar as _calendar
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
-        trip=connection.execute('SELECT * FROM trip_plans WHERE id=?',(trip_id,)).fetchone()
+        trip=_trip_row_for_current_user(connection, trip_id)
         if not trip:
             return None
         schedule=connection.execute('SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1',(trip_id,)).fetchone()
         customers={r['name'].strip().casefold():dict(r) for r in connection.execute('SELECT * FROM route_customers').fetchall()}
-        actions={r['store_name'].strip().casefold():r['n'] for r in connection.execute("SELECT store_name,COUNT(*) n FROM store_actions WHERE status!='Completed' GROUP BY lower(store_name)").fetchall()}
+        action_owner_user_id = _private_workspace_user_id()
+        if action_owner_user_id is not None:
+            action_rows = connection.execute(
+                "SELECT MIN(store_name) AS store_name, COUNT(*) AS n FROM store_actions WHERE status!='Completed' AND owner_user_id=? GROUP BY lower(store_name)",
+                (action_owner_user_id,),
+            ).fetchall()
+        else:
+            action_rows = connection.execute("SELECT MIN(store_name) AS store_name, COUNT(*) AS n FROM store_actions WHERE status!='Completed' GROUP BY lower(store_name)").fetchall()
+        actions={r['store_name'].strip().casefold():r['n'] for r in action_rows}
         notes={}
         notes_by_appointment={}
         notes_by_date_store={}
@@ -7516,9 +8972,17 @@ def build_trip_workspace(trip_id):
         all_customer_names.append(appt['store'])
     pending_actions=0
     if all_customer_names:
-        with sqlite3.connect(DATABASE_PATH) as connection:
+        with db_connect() as connection:
             placeholders=','.join('?' for _ in all_customer_names)
-            pending_actions=connection.execute(f"SELECT COUNT(*) FROM store_actions WHERE status!='Completed' AND lower(store_name) IN ({placeholders})",tuple(x.strip().lower() for x in all_customer_names)).fetchone()[0]
+            action_owner_user_id = _private_workspace_user_id()
+            action_params = tuple(x.strip().lower() for x in all_customer_names)
+            if action_owner_user_id is not None:
+                pending_actions=connection.execute(
+                    f"SELECT COUNT(*) FROM store_actions WHERE status!='Completed' AND lower(store_name) IN ({placeholders}) AND owner_user_id=?",
+                    action_params + (action_owner_user_id,),
+                ).fetchone()[0]
+            else:
+                pending_actions=connection.execute(f"SELECT COUNT(*) FROM store_actions WHERE status!='Completed' AND lower(store_name) IN ({placeholders})", action_params).fetchone()[0]
     trip['completed_at_display']=''
     if trip.get('completed_at'):
         try: trip['completed_at_display']=datetime.fromisoformat(trip['completed_at']).strftime('%d %b %Y at %I:%M %p')
@@ -7529,6 +8993,8 @@ def build_trip_workspace(trip_id):
 
 @app.route('/trip-workspace/<int:trip_id>')
 def trip_workspace(trip_id):
+    if _trip_owner_user_id() is not None and not _trip_accessible(trip_id):
+        abort(403)
     set_active_trip(trip_id)
     workspace=build_trip_workspace(trip_id)
     if not workspace:
@@ -7543,10 +9009,12 @@ def trip_closeout_action(trip_id):
     action=request.form.get('action','save_notes')
     notes_text=request.form.get('closeout_notes','').strip()
     now=datetime.now().isoformat(timespec='seconds')
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
-        trip=connection.execute('SELECT * FROM trip_plans WHERE id=?',(trip_id,)).fetchone()
+        trip=_trip_row_for_current_user(connection, trip_id)
         if not trip:
+            if _trip_owner_user_id() is not None:
+                abort(403)
             return redirect(url_for('trip_prep',error='Trip not found.'))
         schedule=connection.execute('SELECT * FROM trip_schedules WHERE trip_plan_id=? ORDER BY id DESC LIMIT 1',(trip_id,)).fetchone()
         if action=='reopen':
@@ -7560,7 +9028,15 @@ def trip_closeout_action(trip_id):
                 appointments=parse_schedule_appointments(schedule['raw_html'],date.min)
                 saved=connection.execute('SELECT * FROM road_visit_notes WHERE schedule_id=?',(schedule['id'],)).fetchall()
                 note_map={(r['visit_date'],r['visit_time'],r['store_name'].strip().casefold()):r for r in saved}
-                existing={(r[0].strip().casefold(),r[1].strip().casefold()) for r in connection.execute("SELECT store_name,title FROM store_actions WHERE status!='Completed'").fetchall()}
+                action_owner_user_id = _private_workspace_user_id()
+                if action_owner_user_id is not None:
+                    existing_rows = connection.execute(
+                        "SELECT store_name,title FROM store_actions WHERE status!='Completed' AND owner_user_id=?",
+                        (action_owner_user_id,),
+                    ).fetchall()
+                else:
+                    existing_rows = connection.execute("SELECT store_name,title FROM store_actions WHERE status!='Completed'").fetchall()
+                existing={(r[0].strip().casefold(),r[1].strip().casefold()) for r in existing_rows}
                 for appt in appointments:
                     row=note_map.get((appt['date'].isoformat(),appt['time'],appt['store'].strip().casefold()))
                     if row and row['completed']:
@@ -7570,7 +9046,7 @@ def trip_closeout_action(trip_id):
                     if key in existing:
                         continue
                     detail='Skipped during trip.' if row and row['skipped'] else 'Planned call was not marked complete.'
-                    connection.execute("INSERT INTO store_actions (store_name,title,detail,priority,due_date,status,source,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",(appt['store'],title,detail,'Medium',(date.today()+timedelta(days=14)).isoformat(),'Open','Trip Close-Out','',now,now))
+                    connection.execute("INSERT INTO store_actions (store_name,title,detail,priority,due_date,status,source,notes,created_at,updated_at,owner_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",(appt['store'],title,detail,'Medium',(date.today()+timedelta(days=14)).isoformat(),'Open','Trip Close-Out','',now,now,action_owner_user_id))
                     existing.add(key); created+=1
             connection.execute('UPDATE trip_plans SET completed_at=?,closeout_notes=?,updated_at=? WHERE id=?',(now,notes_text,now,trip_id))
         connection.commit()
@@ -7605,13 +9081,13 @@ def download_trip_closeout(trip_id):
 
 def build_reliability_summary():
     issues=[]
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
         active_id=get_active_trip_id()
         active=connection.execute("SELECT trip_name FROM trip_plans WHERE id=?",(active_id,)).fetchone() if active_id else None
         missing_coords=connection.execute("SELECT COUNT(*) FROM route_customers WHERE latitude IS NULL OR longitude IS NULL OR latitude=0 OR longitude=0").fetchone()[0]
         invalid_hours=connection.execute("SELECT COUNT(*) FROM route_customers WHERE customer_open_time>=customer_close_time").fetchone()[0]
-        duplicate_names=connection.execute("SELECT COUNT(*) FROM (SELECT lower(trim(name)) n,COUNT(*) c FROM route_customers GROUP BY n HAVING c>1)").fetchone()[0]
+        duplicate_names=connection.execute("SELECT COUNT(*) FROM (SELECT lower(trim(name)) AS n, COUNT(*) AS c FROM route_customers GROUP BY lower(trim(name)) HAVING COUNT(*) > 1) AS duplicate_groups").fetchone()[0]
         orphan_schedules=connection.execute("SELECT COUNT(*) FROM trip_schedules s LEFT JOIN trip_plans t ON t.id=s.trip_plan_id WHERE s.trip_plan_id IS NOT NULL AND t.id IS NULL").fetchone()[0]
         orphan_notes=connection.execute("SELECT COUNT(*) FROM road_visit_notes n LEFT JOIN trip_schedules s ON s.id=n.schedule_id WHERE s.id IS NULL").fetchone()[0]
         blank_appt_ids=connection.execute("SELECT COUNT(*) FROM road_visit_notes WHERE appointment_id='' AND (visit_notes!='' OR completed=1 OR skipped=1)").fetchone()[0]
@@ -7625,10 +9101,143 @@ def build_reliability_summary():
     if blank_appt_ids: issues.append(f'{blank_appt_ids} older visit record(s) do not yet have permanent appointment IDs; they will be upgraded when opened.')
     backups=sorted(BACKUP_DIR.glob('*.db'),key=lambda x:x.stat().st_mtime,reverse=True)
     return {'active_trip_id':active_id,'active_trip_name':active['trip_name'] if active else '', 'issue_count':len(issues),'issues':issues,'backup_count':len(backups),'latest_backup':backups[0].name if backups else '',
-            'backups':[{'name':b.name,'size':f'{b.stat().st_size/1024/1024:.1f} MB'} for b in backups[:10]],'trips':trips,'recent_audit':recent_audit}
+            'backups':[{'name':b.name,'size':f'{b.stat().st_size/1024/1024:.1f} MB'} for b in backups[:10]],'trips':trips,'recent_audit':recent_audit,'cloud_mode':USE_POSTGRES}
+
+
+DATA_RECOVERY_PAGE = r"""
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Data & Recovery · Riverlea</title>
+<style>:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17202a;background:#f4f7fa}*{box-sizing:border-box}body{margin:0}.wrap{max-width:1240px;margin:auto;padding:28px}.head{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:22px}.card{background:#fff;border:1px solid #dfe6ec;border-radius:15px;padding:20px;margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{border:1px solid #e3e9ee;border-radius:12px;padding:14px}.label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:800;color:#6b7884}.value{font-size:24px;font-weight:850;margin-top:6px}.small{font-size:12px;color:#6b7884}.btn,button{display:inline-block;border:0;border-radius:9px;background:#108dbd;color:#fff;padding:10px 14px;font-weight:800;text-decoration:none;cursor:pointer}.secondary{background:#445765}.ok{padding:11px 13px;background:#eaf8ef;border:1px solid #bfe3ca;border-radius:10px}.warn{padding:11px 13px;background:#fff5e8;border:1px solid #f0d1a7;border-radius:10px}.buttonrow{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:10px 9px;border-bottom:1px solid #edf1f4;font-size:13px;vertical-align:top}th{font-size:11px;text-transform:uppercase;color:#687783}.pill{display:inline-block;padding:4px 8px;border-radius:999px;background:#edf3f6;font-size:11px;font-weight:750}.filters{display:grid;grid-template-columns:1.4fr 1fr 1fr auto;gap:9px;align-items:end}label{font-size:12px;font-weight:800}input,select{display:block;width:100%;margin-top:5px;border:1px solid #cfd8df;border-radius:9px;padding:9px;font:inherit}@media(max-width:850px){.grid,.filters{grid-template-columns:1fr 1fr}.head{align-items:flex-start;flex-direction:column}}@media(max-width:560px){.grid,.filters{grid-template-columns:1fr}}</style></head><body><div class="wrap">
+<div class="head"><div><h1 style="margin:0">Data &amp; Recovery</h1><p class="small" style="font-size:14px;margin:7px 0 0">Admin-only system health, business-data exports and audit history.</p></div><div><a class="btn secondary" href="{{ url_for('settings') }}">Back to Settings</a></div></div>
+<div class="card"><div class="grid"><div class="metric"><div class="label">Database</div><div class="value" style="font-size:19px">{{ summary.database_mode }}</div><div class="small">{{ summary.database_note }}</div></div><div class="metric"><div class="label">Customers</div><div class="value">{{ summary.counts.route_customers }}</div><div class="small">{{ summary.unassigned_customers }} unassigned</div></div><div class="metric"><div class="label">Users</div><div class="value">{{ summary.counts.app_users }}</div><div class="small">{{ summary.active_reps }} active Sales Rep(s)</div></div><div class="metric"><div class="label">Data health</div><div class="value">{{ health.issue_count }}</div><div class="small">structural issue(s)</div></div></div>
+{% if health.issues %}<div class="warn" style="margin-top:16px"><strong>Health findings</strong><ul>{% for issue in health.issues %}<li>{{ issue }}</li>{% endfor %}</ul></div>{% else %}<div class="ok" style="margin-top:16px">No structural data problems detected.</div>{% endif %}
+<div class="buttonrow"><a class="btn" href="{{ url_for('export_business_snapshot') }}">Export Business Snapshot (JSON)</a><a class="btn secondary" href="{{ url_for('export_audit_csv') }}">Export Audit Log (CSV)</a><a class="btn secondary" href="{{ url_for('data_health_report') }}">Health Report</a></div>
+<p class="small" style="margin-top:12px">The JSON snapshot is an application-level recovery/export copy and intentionally excludes password hashes and secrets. {% if summary.cloud_mode %}Neon remains the database-level backup/recovery system for production Postgres.{% else %}Local SQLite database backups remain available from Settings.{% endif %}</p></div>
+<div class="card"><h2 style="margin-top:0">Business records</h2><div class="grid">{% for item in summary.table_counts %}<div class="metric"><div class="label">{{ item.label }}</div><div class="value">{{ item.count }}</div></div>{% endfor %}</div></div>
+<div class="card"><div class="head" style="margin-bottom:12px"><div><h2 style="margin:0">Audit trail</h2><p class="small" style="margin:5px 0 0">Who changed what, newest first. Older events created before Stage 17 may not have an actor recorded.</p></div></div>
+<form class="filters" method="get"><label>Search<input name="q" value="{{ filters.q }}" placeholder="event, detail or user"></label><label>Event<select name="event"><option value="">All events</option>{% for name in event_types %}<option value="{{ name }}" {% if filters.event == name %}selected{% endif %}>{{ name|replace('_',' ')|title }}</option>{% endfor %}</select></label><label>Actor<select name="actor"><option value="">All actors</option>{% for u in audit_users %}<option value="{{ u.email }}" {% if filters.actor == u.email %}selected{% endif %}>{{ u.display_name }} · {{ u.email }}</option>{% endfor %}</select></label><button type="submit">Filter</button></form>
+<div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Time</th><th>Actor</th><th>Event</th><th>Detail</th><th>Trip</th></tr></thead><tbody>{% for row in audit_rows %}<tr><td>{{ row.created_at }}</td><td>{{ row.actor_email or 'Legacy / system' }}</td><td><span class="pill">{{ row.event_type|replace('_',' ')|title }}</span></td><td>{{ row.detail }}</td><td>{{ row.trip_id or '' }}</td></tr>{% else %}<tr><td colspan="5">No audit events match these filters.</td></tr>{% endfor %}</tbody></table></div></div>
+</div></body></html>
+"""
+
+EXPORT_TABLES = [
+    "route_customers", "customer_priorities", "customer_contacts", "store_actions",
+    "monthly_sales", "opportunity_analyses", "rep_bonus_transactions", "weekly_checklist",
+    "trip_plans", "trip_schedules", "trip_appointments", "appointment_objectives",
+    "road_visit_notes", "road_visit_attachments", "route_selections", "travel_trips", "app_state",
+]
+
+
+def _safe_json_value(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return f"<binary:{len(value)} bytes>"
+    return value
+
+
+def _table_rows_for_export(connection, table_name):
+    try:
+        cursor = connection.execute(f"SELECT * FROM {table_name}")
+        return [{key: _safe_json_value(row[key]) for key in row.keys()} for row in cursor.fetchall()]
+    except Exception:
+        return []
+
+
+def build_data_recovery_summary():
+    count_tables = ["route_customers", "app_users", "store_actions", "trip_plans", "road_visit_notes", "customer_contacts", "opportunity_analyses", "monthly_sales", "rep_bonus_transactions", "audit_log"]
+    counts = {name: 0 for name in count_tables}
+    with db_connect() as connection:
+        for name in count_tables:
+            try:
+                counts[name] = int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            except Exception:
+                counts[name] = 0
+        unassigned = int(connection.execute("SELECT COUNT(*) FROM route_customers WHERE assigned_user_id IS NULL").fetchone()[0])
+        active_reps = int(connection.execute("SELECT COUNT(*) FROM app_users WHERE role='sales_rep' AND active=1").fetchone()[0])
+    labels = [
+        ("Customers", "route_customers"), ("Actions", "store_actions"), ("Trips", "trip_plans"),
+        ("Visit notes", "road_visit_notes"), ("Contacts", "customer_contacts"), ("Store analyses", "opportunity_analyses"),
+        ("Monthly sales", "monthly_sales"), ("Bonus transactions", "rep_bonus_transactions"), ("Audit events", "audit_log"),
+    ]
+    return {
+        "cloud_mode": USE_POSTGRES,
+        "database_mode": "Postgres / Neon" if USE_POSTGRES else "SQLite / Local",
+        "database_note": "Cloud production database" if USE_POSTGRES else "Desktop/local database",
+        "counts": counts,
+        "unassigned_customers": unassigned,
+        "active_reps": active_reps,
+        "table_counts": [{"label": label, "count": counts[key]} for label, key in labels],
+    }
+
+
+@app.route('/admin/data-recovery')
+@admin_required
+def data_recovery():
+    q = request.args.get('q', '').strip()
+    event = request.args.get('event', '').strip()
+    actor = request.args.get('actor', '').strip()
+    clauses=[]; params=[]
+    if q:
+        clauses.append("(lower(event_type) LIKE ? OR lower(detail) LIKE ? OR lower(actor_email) LIKE ?)")
+        like=f"%{q.casefold()}%"; params.extend([like,like,like])
+    if event:
+        clauses.append("event_type=?"); params.append(event)
+    if actor:
+        clauses.append("lower(actor_email)=lower(?)"); params.append(actor)
+    where=(' WHERE '+ ' AND '.join(clauses)) if clauses else ''
+    with db_connect() as connection:
+        connection.row_factory=sqlite3.Row
+        audit_rows=[dict(r) for r in connection.execute("SELECT * FROM audit_log"+where+" ORDER BY id DESC LIMIT 250", params).fetchall()]
+        event_types=[r[0] for r in connection.execute("SELECT DISTINCT event_type FROM audit_log WHERE event_type!='' ORDER BY event_type").fetchall()]
+        audit_users=[dict(r) for r in connection.execute("SELECT display_name,email FROM app_users ORDER BY display_name,email").fetchall()]
+    return render_template_string(DATA_RECOVERY_PAGE, summary=build_data_recovery_summary(), health=build_reliability_summary(), audit_rows=audit_rows, event_types=event_types, audit_users=audit_users, filters={'q':q,'event':event,'actor':actor})
+
+
+@app.route('/admin/data-recovery/export.json')
+@admin_required
+def export_business_snapshot():
+    generated_at=datetime.now().isoformat(timespec='seconds')
+    payload={"manifest":{"product":"Riverlea Sales Assistant","generated_at":generated_at,"database_mode":"postgres" if USE_POSTGRES else "sqlite","format_version":1},"tables":{}}
+    with db_connect() as connection:
+        connection.row_factory=sqlite3.Row
+        for table in EXPORT_TABLES:
+            payload["tables"][table]=_table_rows_for_export(connection,table)
+        # User metadata is useful for recovery, but authentication hashes are deliberately excluded.
+        try:
+            users=connection.execute("SELECT id,email,display_name,role,active,created_at,last_login_at FROM app_users ORDER BY id").fetchall()
+            payload["tables"]["app_users"]=[{key:_safe_json_value(row[key]) for key in row.keys()} for row in users]
+        except Exception:
+            payload["tables"]["app_users"]=[]
+        try:
+            audits=connection.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+            payload["tables"]["audit_log"]=[{key:_safe_json_value(row[key]) for key in row.keys()} for row in audits]
+        except Exception:
+            payload["tables"]["audit_log"]=[]
+    payload["manifest"]["row_counts"]={name:len(rows) for name,rows in payload["tables"].items()}
+    raw=json.dumps(payload,ensure_ascii=False,indent=2).encode('utf-8')
+    audit_event('business_snapshot_exported', f"Admin exported application snapshot ({len(raw)} bytes)")
+    return send_file(BytesIO(raw),as_attachment=True,download_name=f"riverlea-business-snapshot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json",mimetype='application/json')
+
+
+@app.route('/admin/data-recovery/audit.csv')
+@admin_required
+def export_audit_csv():
+    out=StringIO(); writer=csv.writer(out)
+    writer.writerow(['id','created_at','actor_email','event_type','detail','trip_id','appointment_id'])
+    with db_connect() as connection:
+        connection.row_factory=sqlite3.Row
+        rows=connection.execute("SELECT id,created_at,actor_email,event_type,detail,trip_id,appointment_id FROM audit_log ORDER BY id").fetchall()
+        for r in rows:
+            writer.writerow([r['id'],r['created_at'],r['actor_email'],r['event_type'],r['detail'],r['trip_id'] or '',r['appointment_id'] or ''])
+    raw=out.getvalue().encode('utf-8-sig')
+    audit_event('audit_log_exported', f"Admin exported {len(rows)} audit event(s)")
+    return send_file(BytesIO(raw),as_attachment=True,download_name=f"riverlea-audit-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",mimetype='text/csv')
+
 
 @app.route('/settings/restore/<path:filename>',methods=['POST'])
 def restore_backup(filename):
+    if USE_POSTGRES:
+        return redirect(url_for("settings", error="Database restore from local SQLite backups is disabled in cloud/Postgres mode."))
     safe=Path(filename).name
     source=BACKUP_DIR/safe
     if not source.exists() or source.suffix!='.db':
@@ -7648,7 +9257,8 @@ def data_health_report():
     lines.extend('- '+x for x in summary['issues'])
     if not summary['issues']: lines.append('- No structural data problems detected.')
     lines.append('')
-    lines.append(f"Backups: {summary['backup_count']}")
+    lines.append('Storage: '+('Postgres / Neon cloud database' if summary.get('cloud_mode') else 'SQLite / local database'))
+    if not summary.get('cloud_mode'): lines.append(f"Local backups: {summary['backup_count']}")
     return app.response_class('\n'.join(lines),mimetype='text/plain',headers={'Content-Disposition':'attachment; filename=data-health-report.txt'})
 
 @app.route('/settings', methods=['GET','POST'])
@@ -7708,7 +9318,7 @@ def settings():
                 return redirect(url_for('settings',error='Enter at least one bulk value to apply.'))
             updates.append('updated_at=?'); values.append(now)
             marks=','.join('?' for _ in ids)
-            with sqlite3.connect(DATABASE_PATH) as connection:
+            with db_connect() as connection:
                 connection.execute(f"UPDATE route_customers SET {', '.join(updates)} WHERE id IN ({marks})",values+ids)
                 connection.commit()
             return redirect(url_for('settings',success=f'Updated {len(ids)} customers.'))
@@ -7718,7 +9328,7 @@ def settings():
                 if key.startswith('name_') and key[5:].isdigit(): ids.append(int(key[5:]))
             saved=0
             try:
-                with sqlite3.connect(DATABASE_PATH) as connection:
+                with db_connect() as connection:
                     for customer_id in ids:
                         old=connection.execute('SELECT name FROM route_customers WHERE id=?',(customer_id,)).fetchone()
                         if not old: continue
@@ -7744,15 +9354,22 @@ def settings():
                             connection.execute('UPDATE road_visit_notes SET store_name=? WHERE store_name=?',(name,old_name))
                         saved += 1
                     connection.commit()
-            except sqlite3.IntegrityError:
+            except DB_INTEGRITY_ERRORS:
                 return redirect(url_for('settings',error='Two customers cannot have the same name. Check any renamed customers.'))
             except (ValueError,TypeError) as exc:
                 return redirect(url_for('settings',error=f'Could not save customer settings: {exc}'))
             return redirect(url_for('settings',success=f'Saved changes for {saved} customers.'))
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
         customers=[]
-        for row in connection.execute('SELECT * FROM route_customers ORDER BY name').fetchall():
+        territory_user_id = _territory_user_id()
+        settings_query = 'SELECT * FROM route_customers'
+        settings_params = []
+        if territory_user_id is not None:
+            settings_query += ' WHERE assigned_user_id=?'
+            settings_params.append(territory_user_id)
+        settings_query += ' ORDER BY name'
+        for row in connection.execute(settings_query, settings_params).fetchall():
             item=dict(row)
             item['last_call_date']=_normalise_date_input(item.get('last_call',''))
             item['priority_tier']=(item.get('priority_tier') or 'C').upper()
@@ -7782,10 +9399,14 @@ def route_planner():
                 ideal_minutes=max(10,min(240,int(request.form.get('ideal_call_minutes','45'))))
             except (TypeError,ValueError):
                 return redirect(url_for('route_planner',error='Choose a customer and enter a valid call duration.'))
-            with sqlite3.connect(DATABASE_PATH) as connection:
-                customer=connection.execute('SELECT name FROM route_customers WHERE id=?',(customer_id,)).fetchone()
+            with db_connect() as connection:
+                territory_user_id = _territory_user_id()
+                if territory_user_id is None:
+                    customer=connection.execute('SELECT name FROM route_customers WHERE id=?',(customer_id,)).fetchone()
+                else:
+                    customer=connection.execute('SELECT name FROM route_customers WHERE id=? AND assigned_user_id=?',(customer_id,territory_user_id)).fetchone()
                 if not customer:
-                    return redirect(url_for('route_planner',error='Customer not found.'))
+                    return redirect(url_for('route_planner',error='Customer not found in your territory.'))
                 connection.execute('UPDATE route_customers SET ideal_call_minutes=?, updated_at=? WHERE id=?',(ideal_minutes,datetime.now().isoformat(timespec='seconds'),customer_id)); connection.commit()
             return redirect(url_for('route_planner',success=f'Saved the standard call duration for {customer[0]}.'))
         if action == 'create_trip_from_route':
@@ -7803,10 +9424,11 @@ def route_planner():
                 return redirect(url_for('route_planner',error=f'Could not create trip: {exc}'))
             now=datetime.now().isoformat(timespec='seconds')
             schedule_html=build_route_schedule_html(trip_name,start_date,payload)
-            with sqlite3.connect(DATABASE_PATH) as connection:
-                cur=connection.execute("INSERT INTO trip_plans (trip_name,destination,start_date,end_date,travel_method,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",(trip_name,destination,start_date,end_date,'Drive','Created from Route Planner',now,now))
+            with db_connect() as connection:
+                owner_user_id = _trip_owner_user_id()
+                cur=connection.execute("INSERT INTO trip_plans (trip_name,destination,start_date,end_date,travel_method,notes,created_at,updated_at,owner_user_id) VALUES (?,?,?,?,?,?,?,?,?)",(trip_name,destination,start_date,end_date,'Drive','Created from Route Planner',now,now,owner_user_id))
                 plan_id=cur.lastrowid
-                connection.execute("INSERT INTO trip_schedules (filename,raw_html,uploaded_at,trip_plan_id) VALUES (?,?,?,?)",(f'Route Planner - {trip_name}.html',schedule_html,now,plan_id))
+                connection.execute("INSERT INTO trip_schedules (filename,raw_html,uploaded_at,trip_plan_id,owner_user_id) VALUES (?,?,?,?,?)",(f'Route Planner - {trip_name}.html',schedule_html,now,plan_id,owner_user_id))
                 connection.commit()
             set_active_trip(plan_id)
             audit_event('trip_created',trip_name,plan_id)
@@ -7815,13 +9437,27 @@ def route_planner():
             name=request.form.get('selection_name','').strip(); raw=request.form.get('selected_ids','').strip()
             ids=[int(x) for x in raw.split(',') if x.strip().isdigit()]
             if not name or not ids: return redirect(url_for('route_planner',error='Enter a name and select at least one customer.'))
-            with sqlite3.connect(DATABASE_PATH) as connection:
-                connection.execute('INSERT INTO route_selections (name,start_date,end_date,customer_ids,created_at) VALUES (?,?,?,?,?)',(name,request.form.get('start_date',''),request.form.get('end_date',''),','.join(map(str,ids)),datetime.now().isoformat(timespec='seconds'))); connection.commit()
+            with db_connect() as connection:
+                connection.execute('INSERT INTO route_selections (name,start_date,end_date,customer_ids,created_at,owner_user_id) VALUES (?,?,?,?,?,?)',(name,request.form.get('start_date',''),request.form.get('end_date',''),','.join(map(str,ids)),datetime.now().isoformat(timespec='seconds'),_trip_owner_user_id())); connection.commit()
             return redirect(url_for('route_planner',success=f'Saved {name} with {len(ids)} customers.'))
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory=sqlite3.Row
-        customers=[dict(r) for r in connection.execute('SELECT * FROM route_customers ORDER BY name').fetchall()]
-        open_actions=connection.execute("SELECT store_name, COUNT(*) AS n FROM store_actions WHERE status != 'Completed' GROUP BY lower(store_name)").fetchall()
+        territory_user_id = _territory_user_id()
+        route_query = 'SELECT * FROM route_customers'
+        route_params = []
+        if territory_user_id is not None:
+            route_query += ' WHERE assigned_user_id=?'
+            route_params.append(territory_user_id)
+        route_query += ' ORDER BY name'
+        customers=[dict(r) for r in connection.execute(route_query, route_params).fetchall()]
+        action_owner_user_id = _private_workspace_user_id()
+        if action_owner_user_id is not None:
+            open_actions=connection.execute(
+                "SELECT MIN(store_name) AS store_name, COUNT(*) AS n FROM store_actions WHERE status != 'Completed' AND owner_user_id=? GROUP BY lower(store_name)",
+                (action_owner_user_id,),
+            ).fetchall()
+        else:
+            open_actions=connection.execute("SELECT MIN(store_name) AS store_name, COUNT(*) AS n FROM store_actions WHERE status != 'Completed' GROUP BY lower(store_name)").fetchall()
         action_map={str(r['store_name']).strip().lower():int(r['n']) for r in open_actions}
         priority_map={row['store_name'].strip().lower():row for row in build_customer_priority_rows()}
         for customer in customers:
@@ -7830,7 +9466,12 @@ def route_planner():
             customer['priority_classification']=priority_map.get(key,{}).get('classification','')
             customer['priority_score']=priority_map.get(key,{}).get('score',0)
         saved=[]
-        for r in connection.execute('SELECT * FROM route_selections ORDER BY id DESC LIMIT 12').fetchall():
+        route_owner_user_id = _trip_owner_user_id()
+        if route_owner_user_id is not None:
+            saved_rows = connection.execute('SELECT * FROM route_selections WHERE owner_user_id=? ORDER BY id DESC LIMIT 12', (route_owner_user_id,)).fetchall()
+        else:
+            saved_rows = connection.execute('SELECT * FROM route_selections ORDER BY id DESC LIMIT 12').fetchall()
+        for r in saved_rows:
             item=dict(r); item['count']=len([x for x in item['customer_ids'].split(',') if x]);
             if item['start_date'] and item['end_date']: item['date_display']=f"{item['start_date']} to {item['end_date']}"
             elif item['start_date']: item['date_display']=item['start_date']
@@ -7841,11 +9482,18 @@ def route_planner():
 
 @app.route('/route-planner/selections/<int:selection_id>/delete', methods=['POST'])
 def delete_route_selection(selection_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        row = connection.execute('SELECT name FROM route_selections WHERE id=?', (selection_id,)).fetchone()
+    with db_connect() as connection:
+        owner_user_id = _trip_owner_user_id()
+        if owner_user_id is not None:
+            row = connection.execute('SELECT name FROM route_selections WHERE id=? AND owner_user_id=?', (selection_id, owner_user_id)).fetchone()
+        else:
+            row = connection.execute('SELECT name FROM route_selections WHERE id=?', (selection_id,)).fetchone()
         if not row:
             return redirect(url_for('route_planner', error='Saved route selection was not found.'))
-        connection.execute('DELETE FROM route_selections WHERE id=?', (selection_id,))
+        if owner_user_id is not None:
+            connection.execute('DELETE FROM route_selections WHERE id=? AND owner_user_id=?', (selection_id, owner_user_id))
+        else:
+            connection.execute('DELETE FROM route_selections WHERE id=?', (selection_id,))
         connection.commit()
     return redirect(url_for('route_planner', success=f'Deleted saved selection: {row[0]}.'))
 
@@ -7853,16 +9501,25 @@ def delete_route_selection(selection_id):
 @app.route('/trip-plans/<int:trip_id>/delete', methods=['POST'])
 def delete_trip_plan(trip_id):
     create_database_backup('before_trip_delete')
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with db_connect() as connection:
         connection.row_factory = sqlite3.Row
-        trip = connection.execute('SELECT * FROM trip_plans WHERE id=?', (trip_id,)).fetchone()
+        trip = _trip_row_for_current_user(connection, trip_id)
         if not trip:
+            if _trip_owner_user_id() is not None:
+                abort(403)
             return redirect(url_for('trip_prep', error='Planned trip was not found.'))
 
-        schedule_rows = connection.execute(
-            "SELECT id FROM trip_schedules WHERE trip_plan_id=? OR (trip_plan_id IS NULL AND filename=?)",
-            (trip_id, f"Route Planner - {trip['trip_name']}.html"),
-        ).fetchall()
+        owner_user_id = _trip_owner_user_id()
+        if owner_user_id is not None:
+            schedule_rows = connection.execute(
+                "SELECT id FROM trip_schedules WHERE owner_user_id=? AND (trip_plan_id=? OR (trip_plan_id IS NULL AND filename=?))",
+                (owner_user_id, trip_id, f"Route Planner - {trip['trip_name']}.html"),
+            ).fetchall()
+        else:
+            schedule_rows = connection.execute(
+                "SELECT id FROM trip_schedules WHERE trip_plan_id=? OR (trip_plan_id IS NULL AND filename=?)",
+                (trip_id, f"Route Planner - {trip['trip_name']}.html"),
+            ).fetchall()
         schedule_ids = [int(row['id']) for row in schedule_rows]
         for schedule_id in schedule_ids:
             connection.execute('DELETE FROM road_visit_notes WHERE schedule_id=?', (schedule_id,))
@@ -7879,28 +9536,58 @@ def delete_trip_plan(trip_id):
 
 @app.route("/actions/<int:action_id>/delete", methods=["POST"])
 def delete_action(action_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.execute("DELETE FROM store_actions WHERE id=?",(action_id,)); connection.commit()
+    with db_connect() as connection:
+        owner_user_id = _private_workspace_user_id()
+        if owner_user_id is not None:
+            connection.execute("DELETE FROM store_actions WHERE id=? AND owner_user_id=?", (action_id, owner_user_id))
+        else:
+            connection.execute("DELETE FROM store_actions WHERE id=?", (action_id,))
+        connection.commit()
     return redirect(url_for("actions", success="Action deleted."))
 
 
 @app.route("/delete-opportunity/<int:analysis_id>", methods=["POST"])
 def delete_opportunity(analysis_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.execute("DELETE FROM opportunity_analyses WHERE id = ?", (analysis_id,))
+    owner_user_id = _private_performance_user_id()
+    with db_connect() as connection:
+        if owner_user_id is not None:
+            connection.execute("DELETE FROM opportunity_analyses WHERE id=? AND owner_user_id=?", (analysis_id, owner_user_id))
+        else:
+            connection.execute("DELETE FROM opportunity_analyses WHERE id=?", (analysis_id,))
         connection.commit()
     return redirect(url_for("opportunity_library", success="Saved store analysis deleted."))
 
 
 @app.route("/delete-month/<int:record_id>", methods=["POST"])
 def delete_month(record_id):
-    with sqlite3.connect(DATABASE_PATH) as connection:
-        connection.execute("DELETE FROM monthly_sales WHERE id = ?", (record_id,))
+    owner_user_id = _private_performance_user_id()
+    with db_connect() as connection:
+        if owner_user_id is not None:
+            connection.execute("DELETE FROM monthly_sales WHERE id=? AND owner_user_id=?", (record_id, owner_user_id))
+        else:
+            connection.execute("DELETE FROM monthly_sales WHERE id=?", (record_id,))
         connection.commit()
     return redirect(url_for("history", success="Saved month deleted."))
 
 
+@app.route("/cloud-health")
+def cloud_health():
+    """Minimal production health check."""
+    try:
+        with db_connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+        return {"status": "ok"}, 200
+    except Exception:
+        return {"status": "error"}, 500
+
+
 init_database()
+ensure_auth_tables()
+ensure_territory_schema()
+ensure_performance_owner_schema()
+ensure_private_workspace_schema()
+ensure_trip_owner_schema()
+ensure_customer_identity_schema()
 
 
 if __name__ == "__main__":
